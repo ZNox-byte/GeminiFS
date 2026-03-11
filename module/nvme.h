@@ -620,6 +620,7 @@ static inline bool nvme_try_complete_req(struct request *req, __le16 status,
 	// 	return true;
 	// return blk_mq_complete_request_remote(req);
 	blk_mq_complete_request(req); //TODO: check if this is correct
+	return true;
 }
 
 static inline void nvme_get_ctrl(struct nvme_ctrl *ctrl)
@@ -762,9 +763,9 @@ void nvme_mpath_shutdown_disk(struct nvme_ns_head *head);
 
 static inline void nvme_trace_bio_complete(struct request *req)
 {
-	struct nvme_ns *ns = req->q->queuedata;
+	// struct nvme_ns *ns = req->q->queuedata;
 
-	if (req->cmd_flags & REQ_NVME_MPATH)
+	// if (req->cmd_flags & REQ_NVME_MPATH)
 		// trace_block_bio_complete(ns->head->disk->queue, req->bio);
 }
 

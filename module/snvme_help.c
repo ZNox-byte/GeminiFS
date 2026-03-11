@@ -3,6 +3,10 @@
 #include "./snvme_help.h"
 #include "ext4.h"
 
+#ifndef in_range
+#define in_range(b, first, len) ((b) >= (first) && (b) <= (first) + (len) - 1)
+#endif
+
 static inline ext4_lblk_t ext4_es_end(struct extent_status *es)
 {
 	BUG_ON(es->es_lblk + es->es_len < es->es_lblk);
@@ -69,15 +73,18 @@ int nds_ext4_retrieve_mapping(struct inode *inode, loff_t offset, loff_t len, st
 out:
 	if(found)
 	{
+		loff_t in_extent_offset;
+        loff_t in_extent_len;
 		BUG_ON(!es1);
 		// printk("The es_lblk is %lu, es_len is %lu, es_pblk is %lx",es1->es_lblk,es1->es_len,ext4_es_pblock(es1));
-		loff_t in_extent_offset = offset - (((u64)es1->es_lblk) << blkbits);
-		loff_t in_extent_len = min(len, (((u64)es1->es_len) << blkbits) - in_extent_offset);
-		mapping->exist = true;
-		mapping->offset = offset;
-		mapping->allocated_len = in_extent_len;
-		mapping->address = (ext4_es_pblock(es1) << blkbits) + in_extent_offset;
-		mapping->blkbit = blkbits;
+		in_extent_offset = offset - (((u64)es1->es_lblk) << blkbits);
+        in_extent_len = min_t(loff_t, len, (((u64)es1->es_len) << blkbits) - in_extent_offset);
+
+        mapping->exist = true;
+        mapping->offset = offset;
+        mapping->allocated_len = in_extent_len;
+        mapping->address = (ext4_es_pblock(es1) << blkbits) + in_extent_offset;
+        mapping->blkbit = blkbits;
 	}
 	return found;
 }
