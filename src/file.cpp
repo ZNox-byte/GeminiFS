@@ -67,6 +67,7 @@ int Host_file_system_int(const char *device, const char *mountPoint)
     }  
     sleep(2);
     std::cerr << "Device mounted successfully at " << mountPoint << std::endl;  
+    return 0;
 }
 
 int Host_file_system_exit(const char *mountPoint)

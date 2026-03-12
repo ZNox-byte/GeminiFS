@@ -160,6 +160,10 @@ int pure_read(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* b
     uint64_t start_block = args->offset;
     size_t size_remaining = args->num_blocks * disk->block_size;
     size_t num_cmds = 0;
+    struct timespec wait_start;
+    struct timespec wait_now;
+    uint64_t waited_us;
+    size_t empty_polls = 0;
 
     size_t sq_pages = NVM_SQ_PAGES(qp->sq->qmem.dma, qp->sq->queue.qs);
     memset(NVM_DMA_OFFSET(qp->sq->qmem.dma, sq_pages), 0, qp->sq->qmem.dma->page_size * (qp->sq->qmem.dma->n_ioaddrs - sq_pages));
@@ -171,10 +175,46 @@ int pure_read(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* b
     size_t completed = 0;
     nvm_cpl_t* cpl;
 
+    clock_gettime(CLOCK_MONOTONIC, &wait_start);
+
     while(completed < num_cmds)
     {
+        if (qp->stop)
+        {
+            return ECANCELED;
+        }
+
         if((cpl = nvm_cq_dequeue_block(cq, 100)) == NULL)
         {
+            ++empty_polls;
+            if ((empty_polls % 10000) == 0)
+            {
+                clock_gettime(CLOCK_MONOTONIC, &wait_now);
+                waited_us = timediff_us(&wait_start, &wait_now);
+                fprintf(stderr,
+                        "pure_read waiting: CQ=%u SQ=%u start_block=%lu num_cmds=%zu completed=%zu waited=%lluus\n",
+                        qp->cq->queue.no,
+                        qp->sq->queue.no,
+                        start_block,
+                        num_cmds,
+                        completed,
+                        (unsigned long long)waited_us);
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &wait_now);
+            waited_us = timediff_us(&wait_start, &wait_now);
+            if (waited_us > 5000000ULL)
+            {
+                fprintf(stderr,
+                        "pure_read timeout: CQ=%u SQ=%u start_block=%lu num_cmds=%zu completed=%zu waited=%lluus\n",
+                        qp->cq->queue.no,
+                        qp->sq->queue.no,
+                        start_block,
+                        num_cmds,
+                        completed,
+                        (unsigned long long)waited_us);
+                return ETIMEDOUT;
+            }
             continue;
         }
 
