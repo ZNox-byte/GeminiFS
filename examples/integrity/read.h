@@ -39,6 +39,8 @@ struct queue_pair
 
 int read_and_dump(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* buffer, const struct file_info* args);
 
+int pure_read(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* buffer, const struct file_info* args);
+
 
 
 

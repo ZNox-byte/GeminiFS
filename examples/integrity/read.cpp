@@ -77,7 +77,7 @@ static size_t rw_bytes(const struct disk* disk, struct queue_pair* qp, const nvm
         num_pages = MIN(buffer->n_ioaddrs - page, num_pages);
 
         nvm_cmd_t* cmd;
-        //如对请求
+        //入队请求
         while ((cmd = nvm_sq_enqueue(sq)) == NULL)
         {
             printf("rw_bytes submit 0");
@@ -155,3 +155,34 @@ int read_and_dump(const struct disk* disk, struct queue_pair* qp, const nvm_dma_
 
 
 
+int pure_read(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* buffer, const struct file_info* args)
+{
+    uint64_t start_block = args->offset;
+    size_t size_remaining = args->num_blocks * disk->block_size;
+    size_t num_cmds = 0;
+
+    size_t sq_pages = NVM_SQ_PAGES(qp->sq->qmem.dma, qp->sq->queue.qs);
+    memset(NVM_DMA_OFFSET(qp->sq->qmem.dma, sq_pages), 0, qp->sq->qmem.dma->page_size * (qp->sq->qmem.dma->n_ioaddrs - sq_pages));
+
+    num_cmds += rw_bytes(disk, qp, buffer, &start_block, &size_remaining, NVM_IO_READ);
+
+    nvm_queue_t* cq = &qp->cq->queue;
+    nvm_queue_t* sq = &qp->sq->queue;
+    size_t completed = 0;
+    nvm_cpl_t* cpl;
+
+    while(completed < num_cmds)
+    {
+        if((cpl = nvm_cq_dequeue_block(cq, 100)) == NULL)
+        {
+            continue;
+        }
+
+        nvm_sq_update(sq);
+
+        nvm_cq_update(cq);
+        completed++;
+    }
+
+    return 0;
+}
