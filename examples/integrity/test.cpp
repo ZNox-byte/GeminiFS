@@ -148,7 +148,8 @@ struct latency_log
 
 struct thread_stats
 {
-    uint64_t io_count;
+    uint64_t hot_io_count;
+    uint64_t cold_io_count;
     int error_status;
 };
 
@@ -159,7 +160,9 @@ struct work_args
     struct disk* disk;
     struct queue_pair* qp;
     nvm_dma_t* dma_buffer;
+    nvm_dma_t* dma_buffer_cold;
     struct file_info* info;
+    struct file_info* info_cold;
     struct latency_log* latencies;
     struct thread_stats* stats;
     
@@ -259,50 +262,121 @@ static useconds_t think_time_us(workload_type workload)
 
 
 
-void work_thread(struct work_args* kthread)
+void work_thread(struct work_args* kthread, experiment_mode mode)
 {
     struct disk* disk = kthread->disk;
     struct queue_pair* qp = kthread->qp;
     nvm_dma_t* dma_buffer = kthread->dma_buffer;
+    nvm_dma_t* dma_buffer_cold = kthread->dma_buffer_cold;
     struct file_info* info = kthread->info;
+    struct file_info* info_cold = kthread->info_cold;
     struct latency_log* latency = kthread->latencies;
     struct thread_stats* stats = kthread->stats;
 
-    while(keep_running.load())
+    if(mode == MODE_ISOLATED)
     {
-        struct timespec start_time;
-        struct timespec end_time;
-        double elapsed_us;
-        int status;
-
-        clock_gettime(CLOCK_MONOTONIC, &start_time);
-        status = pure_read(disk, qp, dma_buffer, info);
-        clock_gettime(CLOCK_MONOTONIC, &end_time);
-        elapsed_us = (double)diff_us(&start_time, &end_time);
-
-        if(status == 0)
+        while(keep_running.load())
         {
-            stats->io_count++;
-            if (kthread->workload == WORKLOAD_HOT && latency != NULL)
+            struct timespec start_time;
+            struct timespec end_time;
+            double elapsed_us;
+            int status;
+
+            clock_gettime(CLOCK_MONOTONIC, &start_time);
+            status = pure_read(disk, qp, dma_buffer, info);
+            clock_gettime(CLOCK_MONOTONIC, &end_time);
+            elapsed_us = (double)diff_us(&start_time, &end_time);
+
+            if(status == 0)
             {
-                latency_log_push(latency, elapsed_us);
+                if(kthread->workload == WORKLOAD_HOT)
+                {
+                    stats->hot_io_count++;
+                }
+                else
+                {
+                    stats->cold_io_count++;
+                }
+                if (kthread->workload == WORKLOAD_HOT && latency != NULL)
+                {
+                    latency_log_push(latency, elapsed_us);
+                }
             }
+            else if(status == ECANCELED)
+            {
+                break;
+            }
+            else
+            {
+                stats->error_status = status;
+                fprintf(stderr,
+                        "[%s Thread %zu] pure_read failed: %s\n",
+                        workload_name(kthread->workload),
+                        kthread->thread_index,
+                        strerror(status));
+                break;
+            }
+            // usleep(think_time_us(kthread->workload));
         }
-        else if(status == ECANCELED)
+    }
+    else
+    {
+        size_t count = 0;
+        while(keep_running.load())
         {
-            break;
+            struct timespec start_time;
+            struct timespec end_time;
+            double elapsed_us;
+            int status;
+            bool is_hot;
+
+            is_hot = count % 4 == 0;
+            if(is_hot)
+            {
+                clock_gettime(CLOCK_MONOTONIC, &start_time);
+                status = pure_read(disk, qp, dma_buffer, info);
+                clock_gettime(CLOCK_MONOTONIC, &end_time);
+                elapsed_us = (double)diff_us(&start_time, &end_time);
+            }
+            else
+            {
+                clock_gettime(CLOCK_MONOTONIC, &start_time);
+                status = pure_read(disk, qp, dma_buffer_cold, info_cold);
+                clock_gettime(CLOCK_MONOTONIC, &end_time);
+                elapsed_us = (double)diff_us(&start_time, &end_time);
+            }
+
+            if(status == 0)
+            {
+                if(is_hot)
+                {
+                    stats->hot_io_count++;
+                    if (latency != NULL)
+                    {
+                        latency_log_push(latency, elapsed_us);
+                    }
+                }
+                else
+                {
+                    stats->cold_io_count++;
+                }
+            }
+            else if(status == ECANCELED)
+            {
+                break;
+            }
+            else
+            {
+                stats->error_status = status;
+                fprintf(stderr,
+                        "[%s Thread %zu] pure_read failed: %s\n",
+                        is_hot ? "Hot" : "Cold",
+                        kthread->thread_index,
+                        strerror(status));
+                break;
+            }
+            count++;
         }
-        else
-        {
-            stats->error_status = status;
-            fprintf(stderr,
-                    "[%s Thread %zu] pure_read failed: %s\n",
-                    workload_name(kthread->workload),
-                    kthread->thread_index,
-                    strerror(status));
-            break;
-        }
-        // usleep(think_time_us(kthread->workload));
     }
 }
 
@@ -312,15 +386,19 @@ int main(int argc, char** argv)
     nvm_ctrl_t* ctrl = NULL;
     struct disk disk;
     struct buffer buffers[TotalThread] = {};
+    struct buffer buffers_cold[TotalThread] = {};
     bool buffer_ready[TotalThread] = {};
+    bool buffer_ready_cold[TotalThread] = {};
     int snvme_c_fd = -1, snvme_d_fd = -1, snvme_helper_fd = -1, fd = -1;
     uint64_t nvme_ofst[TotalThread] = {};
+    uint64_t nvme_ofst_cold[TotalThread] = {};
     int ret, status;
     bool mounted = false;
     char* dummy_buf = NULL;
     struct queue_pair qps[TotalThread] = {};
     struct file_info infos[TotalThread] = {};
-    struct latency_log hot_latencies[HotThread] = {};
+    struct file_info infos_cold[TotalThread] = {};
+    struct latency_log hot_latencies[TotalThread] = {};
     struct work_args work_threads[TotalThread] = {};
     struct thread_stats stats_for_thread[TotalThread] = {};
 
@@ -393,24 +471,48 @@ int main(int argc, char** argv)
         fprintf(stderr, "Failed to enable user I/O queues: %s\n", strerror(status));
         goto out;
     }
-    
-    for(i = 0; i < TotalThread; i++)
+    if(mode == MODE_ISOLATED)
     {
-        if(i < HotThread)
+        for(i = 0; i < TotalThread; i++)
+        {
+            if(i < HotThread)
+            {
+                status = create_buffer(&buffers[i], ctrl, hot_piece_size, 0, -1);
+            }
+            else
+            {
+                status = create_buffer(&buffers[i], ctrl, cold_piece_size, 0, -1);
+            }
+            if (status != 0)
+            {
+                fprintf(stderr, "Failed to allocate DMA buffer for thread %zu: %s\n", i, strerror(status));
+                goto out;
+            }
+            buffer_ready[i] = true;
+        }
+    }
+    else
+    {
+        for(i = 0; i < TotalThread; i++)
         {
             status = create_buffer(&buffers[i], ctrl, hot_piece_size, 0, -1);
+            if (status != 0)
+            {
+                fprintf(stderr, "Failed to allocate DMA buffer for thread %zu: %s\n", i, strerror(status));
+                goto out;
+            }
+            buffer_ready[i] = true;
+
+            status = create_buffer(&buffers_cold[i], ctrl, cold_piece_size, 0, -1);
+            if (status != 0)
+            {
+                fprintf(stderr, "Failed to allocate cold DMA buffer for thread %zu: %s\n", i, strerror(status));
+                goto out;
+            }
+            buffer_ready_cold[i] = true;
         }
-        else
-        {
-            status = create_buffer(&buffers[i], ctrl, cold_piece_size, 0, -1);
-        }
-        if (status != 0)
-        {
-            fprintf(stderr, "Failed to allocate DMA buffer for thread %zu: %s\n", i, strerror(status));
-            goto out;
-        }
-        buffer_ready[i] = true;
     }
+    
 
     // 重绑设备，接管控制权
     status = ioctl_rebind_nvme(ctrl, nvme_pci_addr, 1);
@@ -477,21 +579,42 @@ int main(int argc, char** argv)
         perror("Failed to open helper device");
         goto out;
     }
-
-    for(int i = 0; i < TotalThread; i++)
+    if(mode == MODE_ISOLATED)
     {
-        if(i < HotThread)
+        for(int i = 0; i < TotalThread; i++)
         {
+            if(i < HotThread)
+            {
+                status = map_file_offset(snvme_helper_fd, fd, Hot_ofst + i * hot_piece_size, hot_piece_size, &nvme_ofst[i]);
+                if (status != 0)
+                {
+                    fprintf(stderr, "Failed to map Hot file offset for thread %d: %s\n", i, strerror(status));
+                    goto out;
+                }
+            }
+            else
+            {
+                status = map_file_offset(snvme_helper_fd, fd, Cold_ofst + (i - HotThread) * cold_piece_size, cold_piece_size, &nvme_ofst[i]);
+                if (status != 0)
+                {
+                    fprintf(stderr, "Failed to map Cold file offset for thread %d: %s\n", i, strerror(status));
+                    goto out;
+                }
+            }
+        }
+    }
+    else
+    {
+        for(int i = 0; i < TotalThread; i++)
+        {
+
             status = map_file_offset(snvme_helper_fd, fd, Hot_ofst + i * hot_piece_size, hot_piece_size, &nvme_ofst[i]);
             if (status != 0)
             {
                 fprintf(stderr, "Failed to map Hot file offset for thread %d: %s\n", i, strerror(status));
                 goto out;
             }
-        }
-        else
-        {
-            status = map_file_offset(snvme_helper_fd, fd, Cold_ofst + (i - HotThread) * cold_piece_size, cold_piece_size, &nvme_ofst[i]);
+            status = map_file_offset(snvme_helper_fd, fd, Cold_ofst + i * cold_piece_size, cold_piece_size, &nvme_ofst_cold[i]);
             if (status != 0)
             {
                 fprintf(stderr, "Failed to map Cold file offset for thread %d: %s\n", i, strerror(status));
@@ -508,10 +631,6 @@ int main(int argc, char** argv)
         size_t queue_index;
         if(mode == MODE_ISOLATED)
         {
-            queue_index = i;
-        }
-        else
-        {
             if(i < HotThread)
             {
                 queue_index = i * 4;
@@ -521,6 +640,10 @@ int main(int argc, char** argv)
                 queue_index = ((i - HotThread) % 3) + ((i - HotThread) / 3) * 4 + 1;
             }
         }
+        else
+        {
+            queue_index = i;
+        }
         qps[i].cq = &ctrl->queues[queue_index];
         qps[i].sq = &ctrl->queues[queue_index + ctrl->cq_num];
         qps[i].stop = false;
@@ -529,20 +652,38 @@ int main(int argc, char** argv)
         infos[i].offset = nvme_ofst[i] >> 9;
         infos[i].namespace_id = disk.ns_id;
         infos[i].queue_size = ctrl->qs;
-
-        if(i < HotThread)
+        if(mode == MODE_ISOLATED)
         {
-            infos[i].num_blocks = hot_piece_size >> 9;
-            infos[i].chunk_size = hot_piece_size;
+            if(i < HotThread)
+            {
+                infos[i].num_blocks = hot_piece_size >> 9;
+                infos[i].chunk_size = hot_piece_size;
+            }
+            else
+            {
+                infos[i].num_blocks = cold_piece_size >> 9;
+                infos[i].chunk_size = cold_piece_size;
+            }
+            if(i < HotThread)
+            {
+                status = latency_log_init(&hot_latencies[i], LatencyCapacility);
+                if (status != 0)
+                {
+                    fprintf(stderr, "Failed to allocate latency log for hot thread %zu: %s\n", i, strerror(status));
+                    goto out;
+                }
+            }
         }
         else
         {
-            infos[i].num_blocks = cold_piece_size >> 9;
-            infos[i].chunk_size = cold_piece_size;
-        }
-
-        if(i < HotThread)
-        {
+            
+            infos_cold[i].offset = nvme_ofst_cold[i] >> 9;
+            infos_cold[i].namespace_id = disk.ns_id;
+            infos_cold[i].queue_size = ctrl->qs;
+            infos[i].num_blocks = hot_piece_size >> 9;
+            infos[i].chunk_size = hot_piece_size;
+            infos_cold[i].num_blocks = cold_piece_size >> 9;
+            infos_cold[i].chunk_size = cold_piece_size;
             status = latency_log_init(&hot_latencies[i], LatencyCapacility);
             if (status != 0)
             {
@@ -555,23 +696,34 @@ int main(int argc, char** argv)
         work_threads[i].disk = &disk;
         work_threads[i].dma_buffer = buffers[i].dma;
         work_threads[i].info = &infos[i];
+        
         work_threads[i].qp = &qps[i];
         work_threads[i].stats = &stats_for_thread[i];
-        if(i < HotThread)
+        if(mode == MODE_MIXED)
         {
+            work_threads[i].dma_buffer_cold = buffers_cold[i].dma;
+            work_threads[i].info_cold = &infos_cold[i];
             work_threads[i].latencies = &hot_latencies[i];
-            work_threads[i].workload = WORKLOAD_HOT;
         }
         else
         {
-            work_threads[i].latencies = NULL;
-            work_threads[i].workload = WORKLOAD_COLD;
+            if(i < HotThread)
+            {
+                work_threads[i].latencies = &hot_latencies[i];
+                work_threads[i].workload = WORKLOAD_HOT;
+            }
+            else
+            {
+                work_threads[i].latencies = NULL;
+                work_threads[i].workload = WORKLOAD_COLD;
+            }
         }
+        
     }
 
     if (mode == MODE_MIXED)
     {
-        printf("Mixed mode uses interleaved queue ownership: 1 hot queue + 3 cold queues per 4-queue group.\n");
+        printf("Mixed mode runs 1 hot request and 3 cold requests on each queue pair.\n");
     }
     else
     {
@@ -584,7 +736,7 @@ int main(int argc, char** argv)
     {
         try
         {
-            workers[i] = std::thread(work_thread, &work_threads[i]);
+            workers[i] = std::thread(work_thread, &work_threads[i], mode);
             any_thread_started = true;
         }
         catch (const std::system_error& e)
@@ -611,9 +763,31 @@ int main(int argc, char** argv)
 
     for(int i = 0; i < TotalThread; i++)
     {
-        if(i < HotThread)
+        total_hot_ios += stats_for_thread[i].hot_io_count;
+        total_cold_ios += stats_for_thread[i].cold_io_count;
+
+        if(mode == MODE_ISOLATED)
         {
-            total_hot_ios += stats_for_thread[i].io_count;
+            if(i < HotThread)
+            {
+                if (stats_for_thread[i].error_status != 0)
+                {
+                    hot_error_count++;
+                }
+                all_hot_latencies.insert(all_hot_latencies.end(),
+                                         hot_latencies[i].values,
+                                         hot_latencies[i].values + hot_latencies[i].count);
+            }
+            else
+            {
+                if (stats_for_thread[i].error_status != 0)
+                {
+                    cold_error_count++;
+                }
+            }
+        }
+        else
+        {
             if (stats_for_thread[i].error_status != 0)
             {
                 hot_error_count++;
@@ -621,14 +795,6 @@ int main(int argc, char** argv)
             all_hot_latencies.insert(all_hot_latencies.end(),
                                      hot_latencies[i].values,
                                      hot_latencies[i].values + hot_latencies[i].count);
-        }
-        else
-        {
-            total_cold_ios += stats_for_thread[i].io_count;
-            if (stats_for_thread[i].error_status != 0)
-            {
-                cold_error_count++;
-            }
         }
     }
 
@@ -670,22 +836,21 @@ int main(int argc, char** argv)
     {
         if (buffer_ready[i])
         {
-            // printf("cleanup: remove_buffer[%zu]\n", i);
             remove_buffer(&buffers[i]);
         }
+        if (buffer_ready_cold[i])
+        {
+            remove_buffer(&buffers_cold[i]);
+        }
     }
-    // printf("cleanup: start latency_log_destroy on normal path\n");
-    for (i = 0; i < HotThread; ++i)
+    for (i = 0; i < TotalThread; ++i)
     {
-        printf("cleanup: latency_log_destroy[%zu]\n", i);
         latency_log_destroy(&hot_latencies[i]);
     }
-    // printf("cleanup: start nvm_ctrl_free on normal path\n");
     if (ctrl != NULL)
     {
         nvm_ctrl_free(ctrl);
     }
-    // printf("cleanup: normal path done\n");
     return 0;
 out:
     keep_running = false;
@@ -729,22 +894,21 @@ out:
     {
         if (buffer_ready[i])
         {
-            // printf("cleanup: remove_buffer[%zu]\n", i);
             remove_buffer(&buffers[i]);
         }
+        if (buffer_ready_cold[i])
+        {
+            remove_buffer(&buffers_cold[i]);
+        }
     }
-    // printf("cleanup: start latency_log_destroy on error path\n");
-    for (i = 0; i < HotThread; ++i)
+    for (i = 0; i < TotalThread; ++i)
     {
-        // printf("cleanup: latency_log_destroy[%zu]\n", i);
         latency_log_destroy(&hot_latencies[i]);
     }
-    // printf("cleanup: start nvm_ctrl_free on error path\n");
     if (ctrl != NULL)
     {
         nvm_ctrl_free(ctrl);
     }
-    // printf("cleanup: error path done\n");
     
     return 1;
 }
