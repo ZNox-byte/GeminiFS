@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <nvm_util.h>
 #include "integrity.h"
 
 
@@ -38,8 +39,13 @@ int create_buffer(struct buffer* b, nvm_ctrl_t* ctrl, size_t size,int is_cq, int
 
 void remove_buffer(struct buffer* b)
 {
+    // fprintf(stderr, "remove_buffer: dma=%p buffer=%p\n", (void*)b->dma, b->buffer);
+    // fprintf(stderr, "remove_buffer: start nvm_dma_unmap\n");
     nvm_dma_unmap(b->dma);
+    // fprintf(stderr, "remove_buffer: done nvm_dma_unmap\n");
+    // fprintf(stderr, "remove_buffer: start free host buffer\n");
     free(b->buffer);
+    // fprintf(stderr, "remove_buffer: done free host buffer\n");
 }
 
 
@@ -53,8 +59,11 @@ int create_queue(struct queue* q, nvm_ctrl_t* ctrl, const struct queue* cq, uint
     is_cq = 1;
     if (cq != NULL)
     {
+        size_t sq_pages;
+
         is_cq = 0;
-        qmem_size =  ctrl->qs * sizeof(nvm_cmd_t);
+        sq_pages = NVM_SQ_PAGES(ctrl, ctrl->qs);
+        qmem_size = (sq_pages + ctrl->qs) * ctrl->page_size;
     }
     else
         qmem_size =  ctrl->qs * sizeof(nvm_cpl_t);
@@ -81,4 +90,3 @@ void remove_queue(struct queue* q)
 {
     remove_buffer(&q->qmem);
 }
-

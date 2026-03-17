@@ -11,6 +11,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <atomic>
+#include <vector>
+#include <algorithm>
+#include <thread>
+#include <system_error>
 
 #include "get-offset/get-offset.h"
 #include "integrity.h"
@@ -26,6 +30,18 @@
 #define nvme_pci_addr {0xc3, 0, 0}
 
 std::atomic<bool> keep_running(true);
+
+enum workload_type
+{
+    WORKLOAD_HOT = 0,
+    WORKLOAD_COLD = 1
+};
+
+enum experiment_mode
+{
+    MODE_ISOLATED = 0,
+    MODE_MIXED = 1
+};
 
 static int map_file_offset(int helper_fd, int file_fd, uint64_t file_offset, uint64_t length, uint64_t* nvme_offset)
 {
@@ -72,7 +88,6 @@ static int request_queues(nvm_ctrl_t* ctrl, struct queue** queues)
     status = ioctl_set_qnum(ctrl, ctrl->cq_num+ctrl->sq_num);
     if (status != 0)
     {
-    
         return status;
     }
     // Allocate queue descriptors
@@ -101,7 +116,7 @@ static int request_queues(nvm_ctrl_t* ctrl, struct queue** queues)
         status = create_queue(&q[i + ctrl->cq_num], ctrl, &q[i], i);
         if (status != 0)
         {
-            remove_queues(q, i);
+            remove_queues(q, i + ctrl->cq_num);
             return status;
         }
     }
@@ -110,6 +125,20 @@ static int request_queues(nvm_ctrl_t* ctrl, struct queue** queues)
     return status;
 }
 
+
+static constexpr size_t TotalThread = 16;
+static constexpr size_t HotThread = 4;
+static constexpr size_t ColdThread = TotalThread - HotThread;
+static constexpr size_t hot_piece_size = 4096;
+static constexpr size_t cold_piece_size = 128 * 1024;
+static constexpr uint64_t Hot_ofst = 4096;
+static constexpr uint64_t Cold_ofst = 2ULL * 1024ULL * 1024ULL;
+static constexpr size_t SeedFilseSize  = 16 * 1024 * 1024;
+static constexpr useconds_t HotThinkTime = 50;
+static constexpr useconds_t ColdThinkTime = 1000;
+static constexpr size_t LatencyCapacility = 100000;
+static constexpr unsigned int TestDurationSeconds = 5;
+
 struct latency_log
 {
     double* values;
@@ -117,21 +146,23 @@ struct latency_log
     size_t capacity;
 };
 
-struct hot_thread_args
+struct thread_stats
 {
+    uint64_t io_count;
+    int error_status;
+};
+
+struct work_args
+{
+    size_t thread_index;
+    workload_type workload;
     struct disk* disk;
     struct queue_pair* qp;
     nvm_dma_t* dma_buffer;
     struct file_info* info;
     struct latency_log* latencies;
-};
-
-struct cold_thread_args
-{
-    struct disk* disk;
-    struct queue_pair* qp;
-    nvm_dma_t* dma_buffer;
-    struct file_info* info;
+    struct thread_stats* stats;
+    
 };
 
 static int latency_log_init(struct latency_log* log, size_t capacity)
@@ -165,132 +196,146 @@ static void latency_log_push(struct latency_log* log, double latency)
     }
 }
 
-static int compare_double(const void* lhs, const void* rhs)
+static const char* workload_name(workload_type workload)
 {
-    double left = *(const double*)lhs;
-    double right = *(const double*)rhs;
-
-    if (left < right)
-    {
-        return -1;
-    }
-    if (left > right)
-    {
-        return 1;
-    }
-    return 0;
+    return workload == WORKLOAD_HOT ? "Hot" : "Cold";
 }
 
 static uint64_t diff_us(const struct timespec* start, const struct timespec* end)
 {
-    return (uint64_t)(end->tv_sec - start->tv_sec) * 1000000ULL
-        + (uint64_t)(end->tv_nsec - start->tv_nsec) / 1000ULL;
+    int64_t diff_sec = end->tv_sec - start->tv_sec;
+    int64_t diff_nsec = end->tv_nsec - start->tv_nsec;
+    
+    if (diff_nsec < 0)
+    {
+        diff_sec -= 1;
+        diff_nsec += 1000000000LL;
+    }
+    
+    return (uint64_t)(diff_sec * 1000000ULL + diff_nsec / 1000ULL);
 }
 
-static double percentile_value(const struct latency_log* log, double percentile)
+static double percentile_value(const std::vector<double>& log, double percentile)
 {
     size_t index;
 
-    if (log->count == 0)
+    if(log.empty())
     {
         return 0.0;
     }
-
-    index = (size_t)(log->count * percentile);
-    if (index >= log->count)
+    index = (size_t)(log.size() * percentile);
+    if (index >= log.size())
     {
-        index = log->count - 1;
+        index = log.size() - 1;
     }
-
-    return log->values[index];
+    return log[index];
 }
 
-static void* hot_data(void* arg){
-    struct hot_thread_args* thread_args = (struct hot_thread_args*)arg;
-    struct disk* disk = thread_args->disk;
-    struct queue_pair* qp = thread_args->qp;
-    nvm_dma_t* dma_buffer = thread_args->dma_buffer;
-    struct file_info* info = thread_args->info;
-    struct latency_log* latencies = thread_args->latencies;
-    printf("[Hot Thread] Started on CQ: %u, SQ: %u. IO size: 4KB\n", qp->cq->queue.no, qp->sq->queue.no);
+static experiment_mode parse_mode(int argc, char** argv)
+{
+    if(argc < 2)
+    {
+        return MODE_ISOLATED;
+    }
 
-    info->num_blocks = 4096 >> 9;
+    if (strcmp(argv[1], "isolated") == 0)
+    {
+        return MODE_ISOLATED;
+    }
 
-    while(keep_running)
+    if (strcmp(argv[1], "mixed") == 0)
+    {
+        return MODE_MIXED;
+    }
+
+    fprintf(stderr, "Unknown mode '%s', fallback to isolated\n", argv[1]);
+    return MODE_ISOLATED;
+}
+
+static useconds_t think_time_us(workload_type workload)
+{
+    return workload == WORKLOAD_HOT ? HotThinkTime : ColdThinkTime;
+}
+
+
+
+void work_thread(struct work_args* kthread)
+{
+    struct disk* disk = kthread->disk;
+    struct queue_pair* qp = kthread->qp;
+    nvm_dma_t* dma_buffer = kthread->dma_buffer;
+    struct file_info* info = kthread->info;
+    struct latency_log* latency = kthread->latencies;
+    struct thread_stats* stats = kthread->stats;
+
+    while(keep_running.load())
     {
         struct timespec start_time;
         struct timespec end_time;
         double elapsed_us;
+        int status;
 
         clock_gettime(CLOCK_MONOTONIC, &start_time);
-        int status = pure_read(disk, qp, dma_buffer, info);
+        status = pure_read(disk, qp, dma_buffer, info);
         clock_gettime(CLOCK_MONOTONIC, &end_time);
         elapsed_us = (double)diff_us(&start_time, &end_time);
 
         if(status == 0)
         {
-            latency_log_push(latencies, elapsed_us);
+            stats->io_count++;
+            if (kthread->workload == WORKLOAD_HOT && latency != NULL)
+            {
+                latency_log_push(latency, elapsed_us);
+            }
         }
-        else if (status != ECANCELED)
+        else if(status == ECANCELED)
         {
-            fprintf(stderr, "[Hot Thread] pure_read failed: %s\n", strerror(status));
             break;
         }
-
-        usleep(50);
-
-    }
-    printf("[Hot Thread] Finished.\n");
-    return NULL;
-}
-
-static void* cold_data(void* arg){
-    struct cold_thread_args* thread_args = (struct cold_thread_args*)arg;
-    struct disk* disk = thread_args->disk;
-    struct queue_pair* qp = thread_args->qp;
-    nvm_dma_t* dma_buffer = thread_args->dma_buffer;
-    struct file_info* info = thread_args->info;
-    printf("[Cold Thread] Started on CQ: %u, SQ: %u. IO size: 64KB\n", qp->cq->queue.no, qp->sq->queue.no);
-    info->num_blocks = (1024 * 64) >> 9;
-    while(keep_running)
-    {
-        int status = pure_read(disk, qp, dma_buffer, info);
-        if (status != 0 && status != ECANCELED)
+        else
         {
-            fprintf(stderr, "[Cold Thread] pure_read failed: %s\n", strerror(status));
+            stats->error_status = status;
+            fprintf(stderr,
+                    "[%s Thread %zu] pure_read failed: %s\n",
+                    workload_name(kthread->workload),
+                    kthread->thread_index,
+                    strerror(status));
             break;
         }
+        // usleep(think_time_us(kthread->workload));
     }
-    printf("[Cold Thread] Finished.\n");
-    return NULL;
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    experiment_mode mode = parse_mode(argc, argv);
     nvm_ctrl_t* ctrl = NULL;
     struct disk disk;
-    struct buffer hot_buffer = {};
-    struct buffer cold_buffer = {};
+    struct buffer buffers[TotalThread] = {};
+    bool buffer_ready[TotalThread] = {};
     int snvme_c_fd = -1, snvme_d_fd = -1, snvme_helper_fd = -1, fd = -1;
-    uint64_t hot_nvme_ofst, cold_nvme_ofst;
+    uint64_t nvme_ofst[TotalThread] = {};
     int ret, status;
     bool mounted = false;
-    bool hot_buffer_ready = false;
-    bool cold_buffer_ready = false;
     char* dummy_buf = NULL;
-    struct queue_pair hot_qp, cold_qp;
-    struct file_info hot_info, cold_info;
-    struct latency_log hot_latencies = {};
-    struct hot_thread_args hot_args;
-    struct cold_thread_args cold_args;
-    pthread_t hot_thread = 0;
-    pthread_t cold_thread = 0;
-    bool hot_thread_started = false;
-    bool cold_thread_started = false;
+    struct queue_pair qps[TotalThread] = {};
+    struct file_info infos[TotalThread] = {};
+    struct latency_log hot_latencies[HotThread] = {};
+    struct work_args work_threads[TotalThread] = {};
+    struct thread_stats stats_for_thread[TotalThread] = {};
+
+    std::thread workers[TotalThread];
+
     double avg;
     double p95;
     double p99;
     size_t i;
+    bool any_thread_started = false;
+    std::vector<double> all_hot_latencies;
+    size_t total_hot_ios = 0;
+    size_t total_cold_ios = 0;
+    int hot_error_count = 0;
+    int cold_error_count = 0;
     
     // 1. 初始化控制节点与分配队列 (沿用你跑通的逻辑)
     snvme_c_fd = open(snvme_control_path, O_RDWR); 
@@ -331,8 +376,8 @@ int main()
     snvme_c_fd = -1;
     snvme_d_fd = -1;
 
-    ctrl->cq_num = 16;
-    ctrl->sq_num = 16;
+    ctrl->cq_num = TotalThread;
+    ctrl->sq_num = TotalThread;
     ctrl->qs = 1024;
     
     status = request_queues(ctrl, &ctrl->queues);
@@ -349,20 +394,23 @@ int main()
         goto out;
     }
     
-    // 为热数据和冷数据分别申请独立的 DMA 接收内存
-    status = create_buffer(&hot_buffer, ctrl, 4096, 0, -1);
-    if (status != 0)
+    for(i = 0; i < TotalThread; i++)
     {
-        goto out;
+        if(i < HotThread)
+        {
+            status = create_buffer(&buffers[i], ctrl, hot_piece_size, 0, -1);
+        }
+        else
+        {
+            status = create_buffer(&buffers[i], ctrl, cold_piece_size, 0, -1);
+        }
+        if (status != 0)
+        {
+            fprintf(stderr, "Failed to allocate DMA buffer for thread %zu: %s\n", i, strerror(status));
+            goto out;
+        }
+        buffer_ready[i] = true;
     }
-    hot_buffer_ready = true;
-
-    status = create_buffer(&cold_buffer, ctrl, 1024 * 64, 0, -1);
-    if (status != 0)
-    {
-        goto out;
-    }
-    cold_buffer_ready = true;
 
     // 重绑设备，接管控制权
     status = ioctl_rebind_nvme(ctrl, nvme_pci_addr, 1);
@@ -401,16 +449,17 @@ int main()
         goto out;
     }
 
-    dummy_buf = (char*)calloc(1, 1024 * 1024 * 10);
+    dummy_buf = (char*)calloc(1, SeedFilseSize);
     if (dummy_buf == NULL)
     {
         fprintf(stderr, "Failed to allocate test buffer\n");
         goto out;
     }
 
-    ret = write(fd, dummy_buf, 1024 * 1024 * 10);
+    ret = write(fd, dummy_buf, SeedFilseSize);
     free(dummy_buf);
-    if (ret != 1024 * 1024 * 10)
+    dummy_buf = NULL; //避免第二次free
+    if (ret != (int)SeedFilseSize)
     {
         perror("Failed to seed test file");
         goto out;
@@ -429,132 +478,230 @@ int main()
         goto out;
     }
 
-    status = map_file_offset(snvme_helper_fd, fd, 4096, 4096, &hot_nvme_ofst);
-    if (status != 0)
+    for(int i = 0; i < TotalThread; i++)
     {
-        fprintf(stderr, "Failed to map hot file offset: %s\n", strerror(status));
-        goto out;
-    }
-
-    status = map_file_offset(snvme_helper_fd, fd, 1024 * 128, 1024 * 64, &cold_nvme_ofst);
-    if (status != 0)
-    {
-        fprintf(stderr, "Failed to map cold file offset: %s\n", strerror(status));
-        goto out;
+        if(i < HotThread)
+        {
+            status = map_file_offset(snvme_helper_fd, fd, Hot_ofst + i * hot_piece_size, hot_piece_size, &nvme_ofst[i]);
+            if (status != 0)
+            {
+                fprintf(stderr, "Failed to map Hot file offset for thread %d: %s\n", i, strerror(status));
+                goto out;
+            }
+        }
+        else
+        {
+            status = map_file_offset(snvme_helper_fd, fd, Cold_ofst + (i - HotThread) * cold_piece_size, cold_piece_size, &nvme_ofst[i]);
+            if (status != 0)
+            {
+                fprintf(stderr, "Failed to map Cold file offset for thread %d: %s\n", i, strerror(status));
+                goto out;
+            }
+        }
     }
 
     close(snvme_helper_fd);
     snvme_helper_fd = -1;
 
-    printf("Hot Physical NVMe Offset: %lx\n", hot_nvme_ofst);
-    printf("Cold Physical NVMe Offset: %lx\n", cold_nvme_ofst);
-
-    hot_qp.cq = &ctrl->queues[0];
-    hot_qp.sq = &ctrl->queues[ctrl->cq_num + 0];
-    hot_qp.stop = false;
-    hot_qp.num_cpls = 0;
-
-    cold_qp.cq = &ctrl->queues[1];
-    cold_qp.sq = &ctrl->queues[ctrl->cq_num + 1];
-    cold_qp.stop = false;
-    cold_qp.num_cpls = 0;
-
-    hot_info.offset = hot_nvme_ofst >> 9;
-    hot_info.num_blocks = 4096 >> 9;
-    cold_info.offset = cold_nvme_ofst >> 9;
-    cold_info.num_blocks = (1024 * 64) >> 9;
-
-    status = latency_log_init(&hot_latencies, 100000);
-    if (status != 0)
+    for(i = 0; i < TotalThread; i++)
     {
-        fprintf(stderr, "Failed to allocate latency log: %s\n", strerror(status));
-        goto out;
-    }
-
-    hot_args.disk = &disk;
-    hot_args.qp = &hot_qp;
-    hot_args.dma_buffer = hot_buffer.dma;
-    hot_args.info = &hot_info;
-    hot_args.latencies = &hot_latencies;
-
-    cold_args.disk = &disk;
-    cold_args.qp = &cold_qp;
-    cold_args.dma_buffer = cold_buffer.dma;
-    cold_args.info = &cold_info;
-
-    printf("\n--- Starting Cold-Hot Isolation Test (Duration: 5 seconds) ---\n");
-
-    status = pthread_create(&cold_thread, NULL, cold_data, &cold_args);
-    if (status != 0)
-    {
-        fprintf(stderr, "Failed to start cold thread: %s\n", strerror(status));
-        goto out;
-    }
-    cold_thread_started = true;
-
-    status = pthread_create(&hot_thread, NULL, hot_data, &hot_args);
-    if (status != 0)
-    {
-        fprintf(stderr, "Failed to start hot thread: %s\n", strerror(status));
-        goto out;
-    }
-    hot_thread_started = true;
-
-    sleep(5);
-    keep_running = false;
-    hot_qp.stop = true;
-    cold_qp.stop = true;
-
-    pthread_join(hot_thread, NULL);
-    hot_thread_started = false;
-    pthread_join(cold_thread, NULL);
-    cold_thread_started = false;
-
-    if(hot_latencies.count != 0)
-    {
-        qsort(hot_latencies.values, hot_latencies.count, sizeof(double), compare_double);
-        avg = 0.0;
-        for(i = 0; i < hot_latencies.count; ++i)
+        size_t queue_index;
+        if(mode == MODE_ISOLATED)
         {
-            avg += hot_latencies.values[i];
+            queue_index = i;
         }
-        avg /= hot_latencies.count;
+        else
+        {
+            if(i < HotThread)
+            {
+                queue_index = i * 4;
+            }
+            else
+            {
+                queue_index = ((i - HotThread) % 3) + ((i - HotThread) / 3) * 4 + 1;
+            }
+        }
+        qps[i].cq = &ctrl->queues[queue_index];
+        qps[i].sq = &ctrl->queues[queue_index + ctrl->cq_num];
+        qps[i].stop = false;
+        qps[i].num_cpls = 0;
 
-        p95 = percentile_value(&hot_latencies, 0.95);
-        p99 = percentile_value(&hot_latencies, 0.99);
+        infos[i].offset = nvme_ofst[i] >> 9;
+        infos[i].namespace_id = disk.ns_id;
+        infos[i].queue_size = ctrl->qs;
+
+        if(i < HotThread)
+        {
+            infos[i].num_blocks = hot_piece_size >> 9;
+            infos[i].chunk_size = hot_piece_size;
+        }
+        else
+        {
+            infos[i].num_blocks = cold_piece_size >> 9;
+            infos[i].chunk_size = cold_piece_size;
+        }
+
+        if(i < HotThread)
+        {
+            status = latency_log_init(&hot_latencies[i], LatencyCapacility);
+            if (status != 0)
+            {
+                fprintf(stderr, "Failed to allocate latency log for hot thread %zu: %s\n", i, strerror(status));
+                goto out;
+            }
+        }
+        
+        work_threads[i].thread_index = i;
+        work_threads[i].disk = &disk;
+        work_threads[i].dma_buffer = buffers[i].dma;
+        work_threads[i].info = &infos[i];
+        work_threads[i].qp = &qps[i];
+        work_threads[i].stats = &stats_for_thread[i];
+        if(i < HotThread)
+        {
+            work_threads[i].latencies = &hot_latencies[i];
+            work_threads[i].workload = WORKLOAD_HOT;
+        }
+        else
+        {
+            work_threads[i].latencies = NULL;
+            work_threads[i].workload = WORKLOAD_COLD;
+        }
+    }
+
+    if (mode == MODE_MIXED)
+    {
+        printf("Mixed mode uses interleaved queue ownership: 1 hot queue + 3 cold queues per 4-queue group.\n");
+    }
+    else
+    {
+        printf("Isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data.\n");
+    }
+
+    keep_running = true;
+
+    for(int i = 0; i < TotalThread; i++)
+    {
+        try
+        {
+            workers[i] = std::thread(work_thread, &work_threads[i]);
+            any_thread_started = true;
+        }
+        catch (const std::system_error& e)
+        {
+            fprintf(stderr, "Failed to start worker thread %zu: %s\n", i, e.what());
+            goto out;
+        }
+        
+    }
+    sleep(TestDurationSeconds);
+    keep_running = false;
+    for(i = 0; i < TotalThread; i++)
+    {
+        qps[i].stop = true;
+    }
+
+    for(int i = 0; i < TotalThread; i++)
+    {
+        if(workers[i].joinable())
+            workers[i].join();
+    }
+
+    any_thread_started = false;
+
+    for(int i = 0; i < TotalThread; i++)
+    {
+        if(i < HotThread)
+        {
+            total_hot_ios += stats_for_thread[i].io_count;
+            if (stats_for_thread[i].error_status != 0)
+            {
+                hot_error_count++;
+            }
+            all_hot_latencies.insert(all_hot_latencies.end(),
+                                     hot_latencies[i].values,
+                                     hot_latencies[i].values + hot_latencies[i].count);
+        }
+        else
+        {
+            total_cold_ios += stats_for_thread[i].io_count;
+            if (stats_for_thread[i].error_status != 0)
+            {
+                cold_error_count++;
+            }
+        }
+    }
+
+
+    if (!all_hot_latencies.empty())
+    {
+        std::sort(all_hot_latencies.begin(), all_hot_latencies.end());
+        avg = 0.0;
+        for (double latency : all_hot_latencies)
+        {
+            avg += latency;
+        }
+        avg /= (double)all_hot_latencies.size();
+
+        p95 = percentile_value(all_hot_latencies, 0.95);
+        p99 = percentile_value(all_hot_latencies, 0.99);
 
         printf("\n--- Hot Data Latency Report ---\n");
-        printf("Total Hot Requests: %zu\n", hot_latencies.count);
+        // printf("Mode: %s\n", mode_name(mode));
+        printf("Hot Threads: %zu, Cold Threads: %zu\n", HotThread, ColdThread);
+        printf("Total Hot Requests: %zu\n", all_hot_latencies.size());
         printf("Average Latency: %.2f us\n", avg);
         printf("P95 Tail Latency: %.2f us\n", p95);
         printf("P99 Tail Latency: %.2f us\n", p99);
+        printf("Hot Throughput: %.2f MB/s\n",
+               (double)(total_hot_ios * hot_piece_size) / (1024.0 * 1024.0 * TestDurationSeconds));
+        printf("Cold Throughput: %.2f MB/s\n",
+               (double)(total_cold_ios * cold_piece_size) / (1024.0 * 1024.0 * TestDurationSeconds));
+        printf("Hot Thread Errors: %d\n", hot_error_count);
+        printf("Cold Thread Errors: %d\n", cold_error_count);
     }
 
     close(fd);
     fd = -1;
     Host_file_system_exit(nvme_mount_path);
     mounted = false;
-    if (cold_buffer_ready)
+    // printf("cleanup: start remove_buffer on normal path\n");
+    for (i = 0; i < TotalThread; ++i)
     {
-        remove_buffer(&cold_buffer);
+        if (buffer_ready[i])
+        {
+            // printf("cleanup: remove_buffer[%zu]\n", i);
+            remove_buffer(&buffers[i]);
+        }
     }
-    if (hot_buffer_ready)
+    // printf("cleanup: start latency_log_destroy on normal path\n");
+    for (i = 0; i < HotThread; ++i)
     {
-        remove_buffer(&hot_buffer);
+        printf("cleanup: latency_log_destroy[%zu]\n", i);
+        latency_log_destroy(&hot_latencies[i]);
     }
-    latency_log_destroy(&hot_latencies);
-    nvm_ctrl_free(ctrl);
+    // printf("cleanup: start nvm_ctrl_free on normal path\n");
+    if (ctrl != NULL)
+    {
+        nvm_ctrl_free(ctrl);
+    }
+    // printf("cleanup: normal path done\n");
     return 0;
-
 out:
     keep_running = false;
-    if (hot_thread_started)
+    for (i = 0; i < TotalThread; ++i)
     {
-        pthread_join(hot_thread, NULL);
+        qps[i].stop = true;
     }
-    if (cold_thread_started)
+    if (any_thread_started)
     {
-        pthread_join(cold_thread, NULL);
+        for (i = 0; i < TotalThread; ++i)
+        {
+            if (workers[i].joinable())
+            {
+                workers[i].join();
+            }
+        }
     }
     if (snvme_d_fd >= 0)
     {
@@ -577,18 +724,27 @@ out:
     {
         Host_file_system_exit(nvme_mount_path);
     }
-    if (cold_buffer_ready)
+    // printf("cleanup: start remove_buffer on error path\n");
+    for (i = 0; i < TotalThread; ++i)
     {
-        remove_buffer(&cold_buffer);
+        if (buffer_ready[i])
+        {
+            // printf("cleanup: remove_buffer[%zu]\n", i);
+            remove_buffer(&buffers[i]);
+        }
     }
-    if (hot_buffer_ready)
+    // printf("cleanup: start latency_log_destroy on error path\n");
+    for (i = 0; i < HotThread; ++i)
     {
-        remove_buffer(&hot_buffer);
+        // printf("cleanup: latency_log_destroy[%zu]\n", i);
+        latency_log_destroy(&hot_latencies[i]);
     }
-    latency_log_destroy(&hot_latencies);
+    // printf("cleanup: start nvm_ctrl_free on error path\n");
     if (ctrl != NULL)
     {
         nvm_ctrl_free(ctrl);
     }
+    // printf("cleanup: error path done\n");
+    
     return 1;
 }
