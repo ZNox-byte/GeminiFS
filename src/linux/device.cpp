@@ -332,7 +332,7 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
     
     dev->fd_dev = dup(snvme_d_fd);
     dprintf("fd_dev %d\n", dev->fd_dev);
-    if (dev->fd_control < 0)
+    if (dev->fd_dev < 0)
     {
         close(dev->fd_control);
         free(dev);
@@ -341,7 +341,7 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
     }
     
 
-    err = fcntl(dev->fd_control, F_SETFD, O_RDWR);
+    err = fcntl(dev->fd_control, F_SETFD, FD_CLOEXEC);
     if (err == -1)
     {
         close(dev->fd_control);
@@ -350,7 +350,7 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
         dprintf("Failed to set file descriptor control: %s\n", strerror(errno));
         return errno;
     }
-    err = fcntl(dev->fd_dev, F_SETFD, O_RDWR);
+    err = fcntl(dev->fd_dev, F_SETFD, FD_CLOEXEC);
     if (err == -1)
     {
         close(dev->fd_control);
@@ -361,15 +361,16 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
     }
 
     void* mm_ptr = mmap(NULL, NVM_CTRL_MEM_MINSIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FILE|MAP_LOCKED, dev->fd_dev, 0);
-    if (mm_ptr == NULL)
+    if (mm_ptr == MAP_FAILED)
     {
+        int map_errno = errno;
         close(dev->fd_control);
         close(dev->fd_dev);
         free(dev);
-        dprintf("Failed to map device memory: %s\n", strerror(errno));
-        return err;
+        dprintf("Failed to map device memory: %s\n", strerror(map_errno));
+        return map_errno;
     }    
-    printf("mmap is %lx\n",mm_ptr);
+    printf("mmap is %p\n", mm_ptr);
 
     err = _nvm_ctrl_init(ctrl, dev, &ops, DEVICE_TYPE_IOCTL,mm_ptr,NVM_CTRL_MEM_MINSIZE);
     if (err != 0)
@@ -379,4 +380,3 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int snvme_c_fd, int snvme_d_fd)
     }
     return 0;
 }
-

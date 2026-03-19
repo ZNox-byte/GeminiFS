@@ -8,25 +8,30 @@
 #include <stdbool.h>
 #include <string.h>
 #include <nvm_util.h>
+#include <sys/mman.h>
 #include "integrity.h"
 
 
 int create_buffer(struct buffer* b, nvm_ctrl_t* ctrl, size_t size,int is_cq, int ioq_idx)
 {
     int status;
-    //页对齐分配内存
-    status = posix_memalign(&b->buffer, ctrl->page_size, size);
-    if (status != 0)
+    size_t alloc_size = NVM_PAGE_ALIGN(size, ctrl->page_size);
+
+    // Use anonymous mmap to avoid glibc memalign-path heap assertions.
+    b->buffer = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (b->buffer == MAP_FAILED)
     {
-        fprintf(stderr, "Failed to allocate memory: %s\n", strerror(status));
-        return status;
+        b->buffer = NULL;
+        return errno;
     }
+
     //DMA映射，获取物理地址
-    status = nvm_dma_map_host(&b->dma, ctrl, b->buffer, size, is_cq, ioq_idx);
+    status = nvm_dma_map_host(&b->dma, ctrl, b->buffer, alloc_size, is_cq, ioq_idx);
 
     if (!nvm_ok(status))
     {
-        free(b->buffer);
+        munmap(b->buffer, alloc_size);
+        b->buffer = NULL;
         fprintf(stderr, "Failed to create local segment: %s\n", nvm_strerror(status));
         return status;
     }
@@ -39,13 +44,24 @@ int create_buffer(struct buffer* b, nvm_ctrl_t* ctrl, size_t size,int is_cq, int
 
 void remove_buffer(struct buffer* b)
 {
+    size_t alloc_size = 0;
+    if (b->dma != NULL)
+    {
+        alloc_size = b->dma->page_size * b->dma->n_ioaddrs;
+    }
+
     // fprintf(stderr, "remove_buffer: dma=%p buffer=%p\n", (void*)b->dma, b->buffer);
     // fprintf(stderr, "remove_buffer: start nvm_dma_unmap\n");
     nvm_dma_unmap(b->dma);
     // fprintf(stderr, "remove_buffer: done nvm_dma_unmap\n");
     // fprintf(stderr, "remove_buffer: start free host buffer\n");
-    free(b->buffer);
+    if (b->buffer != NULL && alloc_size > 0)
+    {
+        munmap(b->buffer, alloc_size);
+    }
     // fprintf(stderr, "remove_buffer: done free host buffer\n");
+    b->buffer = NULL;
+    b->dma = NULL;
 }
 
 
