@@ -46,6 +46,7 @@ enum experiment_mode
     MODE_ISOLATED = 0,
     MODE_MIXED = 1,
     MODE_WEAK_MIXED = 2,
+    MODE_STRONG_ISOLATED = 3,
 };
 
 static int map_file_offset(int helper_fd, int file_fd, uint64_t file_offset, uint64_t length, uint64_t* nvme_offset)
@@ -143,7 +144,7 @@ static constexpr useconds_t HotThinkTime = 50;
 static constexpr useconds_t ColdThinkTime = 1000;
 static constexpr size_t LatencyCapacility = 100000;
 static constexpr unsigned int TestDurationSeconds = 5;
-static constexpr size_t MixedInflightDepth = 16;
+static constexpr size_t MixedInflightDepth = 8;
 static constexpr uint16_t RequiredQueueDepth = 64;
 
 struct latency_log
@@ -275,6 +276,11 @@ static experiment_mode parse_mode(int argc, char** argv)
         return MODE_WEAK_MIXED;
     }
 
+    if (strcmp(argv[1], "strong-i") == 0)
+    {
+        return MODE_STRONG_ISOLATED;
+    }
+
     fprintf(stderr, "Unknown mode '%s', fallback to isolated\n", argv[1]);
     return MODE_ISOLATED;
 }
@@ -355,12 +361,13 @@ static int submit_direct_read(const struct disk* disk, struct queue_pair* qp, co
     nvm_cmd_data(cmd, n_lists, n_lists == 0 ? NULL : &list, pages, &buffer->ioaddrs[0]);
     nvm_cmd_rw_blks(cmd, info->offset, num_blocks);
 
+    nvm_sq_submit(sq);
+
     if (submit_time_out != NULL)
     {
+        // Start latency timing after the command is actually submitted.
         clock_gettime(CLOCK_MONOTONIC_RAW, submit_time_out);
     }
-
-    nvm_sq_submit(sq);
 
     if (cid_out != NULL)
     {
@@ -419,6 +426,7 @@ static int read_one_completion(struct queue_pair* qp, uint16_t* cid_out, uint64_
 
     return 0;
 }
+
 
 void work_thread(struct work_args* kthread, experiment_mode mode)
 {
@@ -568,9 +576,21 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
         {
             while(keep_running.load() && inflight_count < inflight_target)
             {
+                const nvm_dma_t* target_buffer = {};
+                const struct file_info* target_info = {};
                 bool is_hot = (issue_count % 4) == 0;
-                const nvm_dma_t* target_buffer = is_hot ? dma_buffer : dma_buffer_cold;
-                const struct file_info* target_info = is_hot ? info : info_cold;
+                if(mode == MODE_MIXED)
+                {
+                    
+                    target_buffer = is_hot ? dma_buffer : dma_buffer_cold;
+                    target_info = is_hot ? info : info_cold;
+                }
+                else if(mode == MODE_STRONG_ISOLATED)
+                {
+                    is_hot = kthread->workload == WORKLOAD_HOT ? 1 : 0;
+                    target_buffer = dma_buffer;
+                    target_info = info;
+                }
                 uint16_t cid = 0;
                 struct timespec submit_time = {};
 
@@ -611,6 +631,7 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
                 inflight[cid].nblocks = (uint16_t)target_info->num_blocks;
                 inflight_count++;
                 issue_count++;
+
             }
 
             if(inflight_count == 0)
@@ -703,10 +724,6 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
                     stats->error_status = status;
                 }
                 break;
-            }
-            if(done_cid >= cid_slots || inflight[done_cid].valid)
-            {
-                continue;
             }
 
             if (done_cid >= cid_slots || !inflight[done_cid].valid)
@@ -850,7 +867,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "Failed to enable user I/O queues: %s\n", strerror(status));
         goto out;
     }
-    if(mode == MODE_ISOLATED)
+    if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
     {
         for(i = 0; i < TotalThread; i++)
         {
@@ -958,7 +975,7 @@ int main(int argc, char** argv)
         perror("Failed to open helper device");
         goto out;
     }
-    if(mode == MODE_ISOLATED)
+    if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
     {
         for(int i = 0; i < TotalThread; i++)
         {
@@ -1008,7 +1025,7 @@ int main(int argc, char** argv)
     for(i = 0; i < TotalThread; i++)
     {
         size_t queue_index;
-        if(mode == MODE_ISOLATED)
+        if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
         {
             if(i < HotThread)
             {
@@ -1031,7 +1048,7 @@ int main(int argc, char** argv)
         infos[i].offset = nvme_ofst[i] >> 9;
         infos[i].namespace_id = disk.ns_id;
         infos[i].queue_size = ctrl->qs;
-        if(mode == MODE_ISOLATED)
+        if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
         {
             if(i < HotThread)
             {
@@ -1103,6 +1120,15 @@ int main(int argc, char** argv)
     if (mode == MODE_MIXED)
     {
         printf("Mixed mode keeps hot+cold requests in-flight on each queue pair (pattern 1 hot : 3 cold, depth=%zu).\n",
+               MixedInflightDepth);
+    }
+    else if (mode == MODE_WEAK_MIXED)
+    {
+        printf("Weak-mixed mode alternates hot/cold requests in the single-issue path.\n");
+    }
+    else if (mode == MODE_STRONG_ISOLATED)
+    {
+        printf("Strong-isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data, while keeping up to %zu requests in flight per queue pair.\n",
                MixedInflightDepth);
     }
     else
