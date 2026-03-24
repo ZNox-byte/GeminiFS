@@ -43,7 +43,7 @@ echo "Waiting for native NVMe driver to settle..."
 sleep 2
 
 sudo insmod snvme-core.ko
-sudo insmod snvme.ko
+sudo insmod snvme.ko io_queue_depth=64
 if [ $? -ne 0 ]; then
     echo -e "${RED}Kernel module insertion failed! Please check dmesg.${NC}"
     exit 1

@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <thread>
 #include <system_error>
+#include <nvm_util.h>
+#include <nvm_queue.h>
+#include <nvm_cmd.h>
+#include <sched.h>
 
 #include "get-offset/get-offset.h"
 #include "integrity.h"
@@ -40,7 +44,8 @@ enum workload_type
 enum experiment_mode
 {
     MODE_ISOLATED = 0,
-    MODE_MIXED = 1
+    MODE_MIXED = 1,
+    MODE_WEAK_MIXED = 2,
 };
 
 static int map_file_offset(int helper_fd, int file_fd, uint64_t file_offset, uint64_t length, uint64_t* nvme_offset)
@@ -138,6 +143,8 @@ static constexpr useconds_t HotThinkTime = 50;
 static constexpr useconds_t ColdThinkTime = 1000;
 static constexpr size_t LatencyCapacility = 100000;
 static constexpr unsigned int TestDurationSeconds = 5;
+static constexpr size_t MixedInflightDepth = 16;
+static constexpr uint16_t RequiredQueueDepth = 64;
 
 struct latency_log
 {
@@ -145,6 +152,18 @@ struct latency_log
     size_t count;
     size_t capacity;
 };
+
+struct inflight_request
+{
+    bool valid;
+    bool is_hot;
+    struct timespec submit_time;
+    uint8_t opcode;
+    uint32_t nsid;
+    uint64_t slba;
+    uint16_t nblocks;
+};
+
 
 struct thread_stats
 {
@@ -251,6 +270,11 @@ static experiment_mode parse_mode(int argc, char** argv)
         return MODE_MIXED;
     }
 
+    if (strcmp(argv[1], "weak-mixed") == 0)
+    {
+        return MODE_WEAK_MIXED;
+    }
+
     fprintf(stderr, "Unknown mode '%s', fallback to isolated\n", argv[1]);
     return MODE_ISOLATED;
 }
@@ -260,7 +284,141 @@ static useconds_t think_time_us(workload_type workload)
     return workload == WORKLOAD_HOT ? HotThinkTime : ColdThinkTime;
 }
 
+static int read_module_io_queue_depth(unsigned int* depth_out)
+{
+    FILE* fp = fopen("/sys/module/snvme/parameters/io_queue_depth", "r");
+    unsigned int depth = 0;
 
+    if(fp == NULL)
+    {
+        return errno;
+    }
+
+    if(fscanf(fp, "%u", &depth) != 1)
+    {
+        fclose(fp);
+        return EIO;
+    }
+
+    fclose(fp);
+
+    if(depth < 2 || depth > 4095)
+    {
+        return ERANGE;
+    }
+
+    *depth_out = depth;
+}
+
+static int submit_direct_read(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* buffer, const struct file_info* info, uint16_t* cid_out, struct timespec* submit_time_out)
+{
+    nvm_queue_t* sq = &qp->sq->queue;
+    size_t bytes = info->num_blocks * disk->block_size;
+    size_t pages = NVM_PAGE_ALIGN(bytes, disk->page_size) / disk->page_size; //字节数换算成页数，第一个函数是对齐用的（假设page_size是4096，如果要读4097的话，就会向上对齐成4096*2）
+    size_t max_pages = disk->max_data_size / disk->page_size;
+
+    if(pages == 0 || pages > buffer->n_ioaddrs || pages > max_pages)
+    {
+        return EINVAL;
+    }
+
+    nvm_cmd_t* cmd = nvm_sq_enqueue(sq);
+    if(cmd == NULL)
+    {
+        nvm_sq_submit(sq);
+        return EAGAIN;
+    }
+
+    memset(cmd, 0, sizeof(nvm_cmd_t));
+
+    uint16_t cmd_slot = (uint16_t)(((uintptr_t)cmd - (uintptr_t)sq->vaddr) / sq->es); //cmd这个指针落在第几个槽位，cmd_slot = (cmd 地址 - 队列起始地址) / 每个命令槽大小
+    uint16_t cid = NVM_DEFAULT_CID(sq); //获取cid
+
+    size_t sq_pages = NVM_SQ_PAGES(qp->sq->qmem.dma, sq->qs);
+    size_t available_prp_pages = (qp->sq->qmem.dma->n_ioaddrs > sq_pages) ? (qp->sq->qmem.dma->n_ioaddrs - sq_pages) : 0;
+    nvm_prp_list_t list = {};
+    size_t n_lists = 0;
+
+    if(pages > 2)
+    {
+        if(available_prp_pages == 0 || cmd_slot >= available_prp_pages)//这个地方得再搞明白一点
+        {
+            return ENOMEM;
+        }
+        list = NVM_PRP_LIST(qp->sq->qmem.dma, sq_pages + cmd_slot);
+        n_lists = 1;
+    }
+
+    size_t num_blocks = NVM_PAGE_TO_BLOCK(disk->page_size, disk->block_size, pages);
+
+    nvm_cmd_header(cmd, cid, NVM_IO_READ, disk->ns_id);
+    nvm_cmd_data(cmd, n_lists, n_lists == 0 ? NULL : &list, pages, &buffer->ioaddrs[0]);
+    nvm_cmd_rw_blks(cmd, info->offset, num_blocks);
+
+    if (submit_time_out != NULL)
+    {
+        clock_gettime(CLOCK_MONOTONIC_RAW, submit_time_out);
+    }
+
+    nvm_sq_submit(sq);
+
+    if (cid_out != NULL)
+    {
+        *cid_out = cid;
+    }
+
+    return 0;
+}
+
+static uint64_t monotonic_time_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int read_one_completion(struct queue_pair* qp, uint16_t* cid_out, uint64_t timeout_ms)
+{
+    nvm_queue_t* cq = &qp->cq->queue;
+    nvm_queue_t* sq = &qp->sq->queue;
+    nvm_cpl_t* cpl = nvm_cq_dequeue(cq); //cpl是完成项指针，里面有cid、status等信息
+    uint64_t deadline_ns = monotonic_time_ns() + timeout_ms * 1000000ULL;//这是个什么算法？
+    size_t spins = 0;
+    int status = 0;
+    uint16_t cid = 0;
+
+    while(cpl == NULL)
+    {
+        if ((++spins & 0x3ff) == 0)
+        {
+            if (monotonic_time_ns() >= deadline_ns)
+            {
+                return ETIMEDOUT;
+            }
+            sched_yield();
+        }
+        cpl = nvm_cq_dequeue(cq);
+    }
+
+    //获取cid和status
+    cid = *NVM_CPL_CID(cpl);
+    status = NVM_ERR_STATUS(cpl);
+
+    nvm_sq_update(sq);
+    nvm_cq_update(cq);
+
+    if (cid_out != NULL)
+    {
+        *cid_out = cid;
+    }
+
+    if (status != 0)
+    {
+        return status;
+    }
+
+    return 0;
+}
 
 void work_thread(struct work_args* kthread, experiment_mode mode)
 {
@@ -319,7 +477,7 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             // usleep(think_time_us(kthread->workload));
         }
     }
-    else
+    else if(mode == MODE_WEAK_MIXED)
     {
         size_t count = 0;
         while(keep_running.load())
@@ -376,6 +534,205 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
                 break;
             }
             count++;
+        }
+    }
+    else
+    {
+        size_t cid_slots = qp->sq->queue.qs * 2;
+        size_t inflight_target = MixedInflightDepth;
+        std::vector<struct inflight_request> inflight(cid_slots);
+        size_t inflight_count = 0;
+        size_t issue_count = 0;
+        int status = 0;
+        size_t sq_pages = NVM_SQ_PAGES(qp->sq->qmem.dma, qp->sq->queue.qs);//当前这个sq要占用多少个page
+
+        if(cid_slots == 0)
+        {
+            stats->error_status = EINVAL;
+            return;
+        }
+
+        if(inflight_target >= qp->sq->queue.qs)
+        {
+            inflight_target = qp->sq->queue.qs > 1 ? (qp->sq->queue.qs - 1) : 1;
+        }
+
+        if(qp->sq->qmem.dma->n_ioaddrs > sq_pages)
+        {
+            memset(NVM_DMA_OFFSET(qp->sq->qmem.dma, sq_pages), 0,
+                        qp->sq->qmem.dma->page_size * (qp->sq->qmem.dma->n_ioaddrs - sq_pages));
+            //第一个参数是起始点，跳过sq的原文，第三个参数是长度
+        }
+
+        while(keep_running.load())
+        {
+            while(keep_running.load() && inflight_count < inflight_target)
+            {
+                bool is_hot = (issue_count % 4) == 0;
+                const nvm_dma_t* target_buffer = is_hot ? dma_buffer : dma_buffer_cold;
+                const struct file_info* target_info = is_hot ? info : info_cold;
+                uint16_t cid = 0;
+                struct timespec submit_time = {};
+
+                status = submit_direct_read(disk, qp, target_buffer, target_info, &cid, &submit_time);
+
+                if(status == EAGAIN)
+                {
+                    break;
+                }
+
+                if(status != 0)
+                {
+                    stats->error_status = status;
+                    fprintf(stderr,
+                            "[Mixed Thread %zu] submit failed: %s\n",
+                            kthread->thread_index,
+                            nvm_strerror(status));
+                    return;
+                }
+                if(cid >= cid_slots || inflight[cid].valid)
+                {
+                    stats->error_status = EOVERFLOW;
+                    fprintf(stderr,
+                            "[Mixed Thread %zu] invalid cid state: cid=%u slots=%zu valid=%d\n",
+                            kthread->thread_index,
+                            cid,
+                            cid_slots,
+                            cid < cid_slots ? (int)inflight[cid].valid : -1);
+                    return;
+                }
+
+                inflight[cid].submit_time = submit_time;
+                inflight[cid].is_hot = is_hot;
+                inflight[cid].valid = true;
+                inflight[cid].opcode = NVM_IO_READ;
+                inflight[cid].nsid = disk->ns_id;
+                inflight[cid].slba = target_info->offset;
+                inflight[cid].nblocks = (uint16_t)target_info->num_blocks;
+                inflight_count++;
+                issue_count++;
+            }
+
+            if(inflight_count == 0)
+            {
+                usleep(1);
+                continue;
+            }
+
+            uint16_t done_cid = 0;
+            status = read_one_completion(qp, &done_cid, 100);
+            
+            if(status == ETIMEDOUT)
+            {
+                if(qp->stop || !keep_running.load())
+                {
+                    break;
+                }
+                continue;
+            }
+
+            if(status != 0)
+            {
+                stats->error_status = status;
+                fprintf(stderr,
+                        "[Mixed Thread %zu] completion failed: %s (SQ=%u CQ=%u inflight=%zu)\n",
+                        kthread->thread_index,
+                        nvm_strerror(status),
+                        qp->sq->queue.no,
+                        qp->cq->queue.no,
+                        inflight_count);
+                if (done_cid < cid_slots && inflight[done_cid].valid)
+                {
+                    fprintf(stderr,
+                            "[Mixed Thread %zu] failed cid=%u op=0x%x nsid=%u slba=%lu nblk=%u\n",
+                            kthread->thread_index,
+                            done_cid,
+                            inflight[done_cid].opcode,
+                            inflight[done_cid].nsid,
+                            inflight[done_cid].slba,
+                            inflight[done_cid].nblocks);
+                }
+                break;
+
+            }
+
+            if(done_cid >= cid_slots || !inflight[done_cid].valid)
+            {
+                stats->error_status = EIO;
+                fprintf(stderr,
+                        "[Mixed Thread %zu] completion cid mismatch: cid=%u slots=%zu\n",
+                        kthread->thread_index,
+                        done_cid,
+                        cid_slots);
+                break;
+            }
+
+            struct timespec done_time;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &done_time);
+
+            if(inflight[done_cid].is_hot)
+            {
+                stats->hot_io_count++;
+                if(latency != NULL)
+                {
+                    double elapsed_us = (double)diff_us(&inflight[done_cid].submit_time, &done_time);
+                    latency_log_push(latency, elapsed_us);
+                }
+            }
+            else
+            {
+                stats->cold_io_count++;
+            }
+
+            inflight[done_cid].valid = false;
+            inflight_count--;
+        }
+
+        while(inflight_count > 0)
+        {
+            uint16_t done_cid = 0;
+            status = read_one_completion(qp, &done_cid, 10);
+            if(status == ETIMEDOUT)
+            {
+                break;
+            }
+            if(status != 0)
+            {
+                if(stats->error_status == 0)
+                {
+                    stats->error_status = status;
+                }
+                break;
+            }
+            if(done_cid >= cid_slots || inflight[done_cid].valid)
+            {
+                continue;
+            }
+
+            if (done_cid >= cid_slots || !inflight[done_cid].valid)
+            {
+                continue;
+            }
+
+            struct timespec done_time;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &done_time);
+
+            if (inflight[done_cid].is_hot)
+            {
+                stats->hot_io_count++;
+                if (latency != NULL)
+                {
+                    double elapsed_us = (double)diff_us(&inflight[done_cid].submit_time, &done_time);
+                    latency_log_push(latency, elapsed_us);
+                }
+            }
+            else
+            {
+                stats->cold_io_count++;
+            }
+
+            inflight[done_cid].valid = false;
+            inflight_count--;
         }
     }
 }
@@ -456,7 +813,29 @@ int main(int argc, char** argv)
 
     ctrl->cq_num = TotalThread;
     ctrl->sq_num = TotalThread;
-    ctrl->qs = 1024;
+    ctrl->qs = RequiredQueueDepth;
+
+    unsigned int module_qs = 0;
+    status = read_module_io_queue_depth(&module_qs);
+    if(status == 0)
+    {
+        if(module_qs != RequiredQueueDepth)
+        {
+            fprintf(stderr,
+                    "Queue depth mismatch: module io_queue_depth=%u, benchmark expects %u.\n"
+                    "Please reload module with: sudo insmod snvme.ko io_queue_depth=%u\n",
+                    module_qs,
+                    RequiredQueueDepth,
+                    RequiredQueueDepth);
+            goto out;
+        }
+    }
+    else
+    {
+        fprintf(stderr,
+                "Warning: failed to read /sys/module/snvme/parameters/io_queue_depth: %s\n",
+                strerror(status));
+    }
     
     status = request_queues(ctrl, &ctrl->queues);
     if (status != 0)
@@ -723,7 +1102,8 @@ int main(int argc, char** argv)
 
     if (mode == MODE_MIXED)
     {
-        printf("Mixed mode runs 1 hot request and 3 cold requests on each queue pair.\n");
+        printf("Mixed mode keeps hot+cold requests in-flight on each queue pair (pattern 1 hot : 3 cold, depth=%zu).\n",
+               MixedInflightDepth);
     }
     else
     {
@@ -801,6 +1181,8 @@ int main(int argc, char** argv)
 
     if (!all_hot_latencies.empty())
     {
+        bool run_valid = (hot_error_count == 0 && cold_error_count == 0);
+
         std::sort(all_hot_latencies.begin(), all_hot_latencies.end());
         avg = 0.0;
         for (double latency : all_hot_latencies)
@@ -813,6 +1195,10 @@ int main(int argc, char** argv)
         p99 = percentile_value(all_hot_latencies, 0.99);
 
         printf("\n--- Hot Data Latency Report ---\n");
+        if (!run_valid)
+        {
+            printf("WARNING: completion errors detected, this latency sample is invalid for comparison.\n");
+        }
         // printf("Mode: %s\n", mode_name(mode));
         printf("Hot Threads: %zu, Cold Threads: %zu\n", HotThread, ColdThread);
         printf("Total Hot Requests: %zu\n", all_hot_latencies.size());
