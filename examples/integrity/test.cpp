@@ -144,8 +144,15 @@ static constexpr useconds_t HotThinkTime = 50;
 static constexpr useconds_t ColdThinkTime = 1000;
 static constexpr size_t LatencyCapacility = 100000;
 static constexpr unsigned int TestDurationSeconds = 5;
-static constexpr size_t MixedInflightDepth = 8;
+static constexpr size_t MixedInflightDepth = 16;
+static constexpr size_t StrongIsolatedHotInflightDepth = 16;
+static constexpr size_t StrongIsolatedColdInflightDepth = 8;
 static constexpr uint16_t RequiredQueueDepth = 64;
+static constexpr size_t HotRequestBudgetTotal = 10000;
+static constexpr size_t ColdRequestBudgetTotal = 60000;
+
+std::atomic<size_t> hot_requests_issued(0);
+std::atomic<size_t> cold_requests_issued(0);
 
 struct latency_log
 {
@@ -254,6 +261,47 @@ static double percentile_value(const std::vector<double>& log, double percentile
     return log[index];
 }
 
+static bool try_reserve_request_slot(workload_type workload)
+{
+    std::atomic<size_t>* issued = workload == WORKLOAD_HOT ? &hot_requests_issued : &cold_requests_issued;
+    size_t limit = workload == WORKLOAD_HOT ? HotRequestBudgetTotal : ColdRequestBudgetTotal;
+    size_t current = issued->load(std::memory_order_relaxed);
+
+    while (current < limit)
+    {
+        if (issued->compare_exchange_weak(current,
+                                          current + 1,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool reserve_mixed_request_slot(size_t issue_count, bool* is_hot_out)
+{
+    bool preferred_hot = (issue_count % 4) == 0;
+    workload_type preferred = preferred_hot ? WORKLOAD_HOT : WORKLOAD_COLD;
+    workload_type alternate = preferred_hot ? WORKLOAD_COLD : WORKLOAD_HOT;
+
+    if (try_reserve_request_slot(preferred))
+    {
+        *is_hot_out = preferred_hot;
+        return true;
+    }
+
+    if (try_reserve_request_slot(alternate))
+    {
+        *is_hot_out = !preferred_hot;
+        return true;
+    }
+
+    return false;
+}
+
 static experiment_mode parse_mode(int argc, char** argv)
 {
     if(argc < 2)
@@ -314,6 +362,7 @@ static int read_module_io_queue_depth(unsigned int* depth_out)
     }
 
     *depth_out = depth;
+    return 0;
 }
 
 static int submit_direct_read(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* buffer, const struct file_info* info, uint16_t* cid_out, struct timespec* submit_time_out)
@@ -448,6 +497,11 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             double elapsed_us;
             int status;
 
+            if (!try_reserve_request_slot(kthread->workload))
+            {
+                break;
+            }
+
             clock_gettime(CLOCK_MONOTONIC, &start_time);
             status = pure_read(disk, qp, dma_buffer, info);
             clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -497,6 +551,20 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             bool is_hot;
 
             is_hot = count % 4 == 0;
+            if (is_hot)
+            {
+                if (!try_reserve_request_slot(WORKLOAD_HOT))
+                {
+                    break;
+                }
+            }
+            else
+            {
+                if (!try_reserve_request_slot(WORKLOAD_COLD))
+                {
+                    break;
+                }
+            }
             if(is_hot)
             {
                 clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -553,11 +621,19 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
         size_t issue_count = 0;
         int status = 0;
         size_t sq_pages = NVM_SQ_PAGES(qp->sq->qmem.dma, qp->sq->queue.qs);//当前这个sq要占用多少个page
+        bool submission_budget_exhausted = false;
 
         if(cid_slots == 0)
         {
             stats->error_status = EINVAL;
             return;
+        }
+
+        if (mode == MODE_STRONG_ISOLATED)
+        {
+            inflight_target = (kthread->workload == WORKLOAD_HOT)
+                ? StrongIsolatedHotInflightDepth
+                : StrongIsolatedColdInflightDepth;
         }
 
         if(inflight_target >= qp->sq->queue.qs)
@@ -578,22 +654,30 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             {
                 const nvm_dma_t* target_buffer = {};
                 const struct file_info* target_info = {};
-                bool is_hot = (issue_count % 4) == 0;
+                bool is_hot = false;
                 if(mode == MODE_MIXED)
                 {
-                    
+                    if (!reserve_mixed_request_slot(issue_count, &is_hot))
+                    {
+                        submission_budget_exhausted = true;
+                        break;
+                    }
                     target_buffer = is_hot ? dma_buffer : dma_buffer_cold;
                     target_info = is_hot ? info : info_cold;
                 }
                 else if(mode == MODE_STRONG_ISOLATED)
                 {
                     is_hot = kthread->workload == WORKLOAD_HOT ? 1 : 0;
+                    if (!try_reserve_request_slot(is_hot ? WORKLOAD_HOT : WORKLOAD_COLD))
+                    {
+                        submission_budget_exhausted = true;
+                        break;
+                    }
                     target_buffer = dma_buffer;
                     target_info = info;
                 }
                 uint16_t cid = 0;
                 struct timespec submit_time = {};
-
                 status = submit_direct_read(disk, qp, target_buffer, target_info, &cid, &submit_time);
 
                 if(status == EAGAIN)
@@ -636,6 +720,10 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
 
             if(inflight_count == 0)
             {
+                if (submission_budget_exhausted)
+                {
+                    break;
+                }
                 usleep(1);
                 continue;
             }
@@ -781,6 +869,7 @@ int main(int argc, char** argv)
     double avg;
     double p95;
     double p99;
+    double elapsed_seconds = 0.0;
     size_t i;
     bool any_thread_started = false;
     std::vector<double> all_hot_latencies;
@@ -788,6 +877,8 @@ int main(int argc, char** argv)
     size_t total_cold_ios = 0;
     int hot_error_count = 0;
     int cold_error_count = 0;
+    uint64_t run_start_ns = 0;
+    uint64_t run_end_ns = 0;
     
     // 1. 初始化控制节点与分配队列 (沿用你跑通的逻辑)
     snvme_c_fd = open(snvme_control_path, O_RDWR); 
@@ -1095,7 +1186,7 @@ int main(int argc, char** argv)
         
         work_threads[i].qp = &qps[i];
         work_threads[i].stats = &stats_for_thread[i];
-        if(mode == MODE_MIXED)
+        if(mode == MODE_MIXED || mode == MODE_WEAK_MIXED)
         {
             work_threads[i].dma_buffer_cold = buffers_cold[i].dma;
             work_threads[i].info_cold = &infos_cold[i];
@@ -1128,15 +1219,20 @@ int main(int argc, char** argv)
     }
     else if (mode == MODE_STRONG_ISOLATED)
     {
-        printf("Strong-isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data, while keeping up to %zu requests in flight per queue pair.\n",
-               MixedInflightDepth);
+        printf("Strong-isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data, with hot depth=%zu and cold depth=%zu per queue pair.\n",
+               StrongIsolatedHotInflightDepth,
+               StrongIsolatedColdInflightDepth);
     }
     else
     {
         printf("Isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data.\n");
     }
+    printf("Request budget: hot=%zu, cold=%zu\n", HotRequestBudgetTotal, ColdRequestBudgetTotal);
 
     keep_running = true;
+    hot_requests_issued.store(0, std::memory_order_relaxed);
+    cold_requests_issued.store(0, std::memory_order_relaxed);
+    run_start_ns = monotonic_time_ns();
 
     for(int i = 0; i < TotalThread; i++)
     {
@@ -1152,20 +1248,26 @@ int main(int argc, char** argv)
         }
         
     }
-    sleep(TestDurationSeconds);
-    keep_running = false;
-    for(i = 0; i < TotalThread; i++)
-    {
-        qps[i].stop = true;
-    }
 
     for(int i = 0; i < TotalThread; i++)
     {
         if(workers[i].joinable())
             workers[i].join();
     }
+    run_end_ns = monotonic_time_ns();
+
+    keep_running = false;
+    for(i = 0; i < TotalThread; i++)
+    {
+        qps[i].stop = true;
+    }
 
     any_thread_started = false;
+    elapsed_seconds = (double)(run_end_ns - run_start_ns) / 1000000000.0;
+    if (elapsed_seconds <= 0.0)
+    {
+        elapsed_seconds = 1e-9;
+    }
 
     for(int i = 0; i < TotalThread; i++)
     {
@@ -1227,14 +1329,15 @@ int main(int argc, char** argv)
         }
         // printf("Mode: %s\n", mode_name(mode));
         printf("Hot Threads: %zu, Cold Threads: %zu\n", HotThread, ColdThread);
+        printf("Elapsed Time: %.3f s\n", elapsed_seconds);
         printf("Total Hot Requests: %zu\n", all_hot_latencies.size());
         printf("Average Latency: %.2f us\n", avg);
         printf("P95 Tail Latency: %.2f us\n", p95);
         printf("P99 Tail Latency: %.2f us\n", p99);
         printf("Hot Throughput: %.2f MB/s\n",
-               (double)(total_hot_ios * hot_piece_size) / (1024.0 * 1024.0 * TestDurationSeconds));
+               (double)(total_hot_ios * hot_piece_size) / (1024.0 * 1024.0 * elapsed_seconds));
         printf("Cold Throughput: %.2f MB/s\n",
-               (double)(total_cold_ios * cold_piece_size) / (1024.0 * 1024.0 * TestDurationSeconds));
+               (double)(total_cold_ios * cold_piece_size) / (1024.0 * 1024.0 * elapsed_seconds));
         printf("Hot Thread Errors: %d\n", hot_error_count);
         printf("Cold Thread Errors: %d\n", cold_error_count);
     }
