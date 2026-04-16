@@ -1,10 +1,13 @@
 #!/bin/bash
 
+QUEUE_DEPTH="${1:-128}"
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}==== Starting GeminiFS Recompile & Env Reset ====${NC}"
+echo -e "${GREEN}Using io_queue_depth=${QUEUE_DEPTH}${NC}"
 
 echo -e "${GREEN}[1/5] Cleaning up build directory...${NC}"
 rm -rf build
@@ -43,7 +46,7 @@ echo "Waiting for native NVMe driver to settle..."
 sleep 2
 
 sudo insmod snvme-core.ko multipath=0
-sudo insmod snvme.ko io_queue_depth=64
+sudo insmod snvme.ko io_queue_depth="${QUEUE_DEPTH}"
 if [ $? -ne 0 ]; then
     echo -e "${RED}Kernel module insertion failed! Please check dmesg.${NC}"
     exit 1

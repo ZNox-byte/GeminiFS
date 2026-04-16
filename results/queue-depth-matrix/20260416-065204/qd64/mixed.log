@@ -1,0 +1,20 @@
+mmap is 0x7f651776b000
+dstrd  is 0, ctrl->timeout is 30000, max qs is  1024
+request_queues success
+idx start is 129, dbstrd is 0, nr user q is 16
+Mixed mode runs 4 hot producer threads and 12 cold producer threads over 16 shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals. Mixed inflight=32 per queue pair.
+Timed run: 5 s
+Queue depth: 64
+Mixed inflight: 32 | Strong hot inflight: 16 | Strong cold inflight: 8
+
+--- Hot Data Latency Report ---
+Hot Threads: 4, Cold Threads: 12
+Elapsed Time: 5.043 s
+Total Hot Requests: 49840
+Average Latency: 159913.40 us
+P95 Tail Latency: 364755.00 us
+P99 Tail Latency: 441491.00 us
+Hot Throughput: 38.60 MB/s
+Cold Throughput: 3128.53 MB/s
+Hot Thread Errors: 0
+Cold Thread Errors: 0

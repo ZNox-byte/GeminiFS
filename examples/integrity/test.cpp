@@ -152,13 +152,34 @@ static constexpr useconds_t HotThinkTime = 50;
 static constexpr useconds_t ColdThinkTime = 1000;
 static constexpr size_t LatencyCapacility = 100000;
 static constexpr unsigned int TestDurationSeconds = 5;
-static constexpr size_t MixedInflightDepth = 16;
-static constexpr size_t MixedPendingDepthPerGroup = MixedInflightDepth * 8;
+static constexpr size_t DefaultMixedInflightDepth = 16;
+static constexpr size_t MixedPendingDepthMultiplier = 8;
 static constexpr size_t MixedQueueCount = TotalThread;
-static constexpr size_t StrongIsolatedHotInflightDepth = 16;
-static constexpr size_t StrongIsolatedColdInflightDepth = 8;
-static constexpr uint16_t RequiredQueueDepth = 64;
+static constexpr size_t DefaultStrongIsolatedHotInflightDepth = 16;
+static constexpr size_t DefaultStrongIsolatedColdInflightDepth = 8;
+static constexpr uint16_t DefaultQueueDepth = 128;
 static constexpr size_t DispatchCidCount = 1u << 16;
+
+struct run_config
+{
+    bool use_budget;
+    size_t hot_budget;
+    size_t cold_budget;
+    uint16_t queue_depth;
+    size_t mixed_inflight_depth;
+    size_t strong_hot_inflight_depth;
+    size_t strong_cold_inflight_depth;
+};
+
+static struct run_config g_run_config = {false,
+                                         0,
+                                         0,
+                                         DefaultQueueDepth,
+                                         DefaultMixedInflightDepth,
+                                         DefaultStrongIsolatedHotInflightDepth,
+                                         DefaultStrongIsolatedColdInflightDepth};
+static std::atomic<size_t> g_hot_generated(0);
+static std::atomic<size_t> g_cold_generated(0);
 
 struct latency_log
 {
@@ -357,6 +378,159 @@ static bool try_pop_dispatch_request_locked(struct dispatch_group_state* group,
     }
 
     return false;
+}
+
+static int parse_size_option(const char* value, size_t* out)
+{
+    char* endptr = NULL;
+    unsigned long long parsed = strtoull(value, &endptr, 10);
+
+    if (value[0] == '\0' || endptr == value || *endptr != '\0')
+    {
+        return EINVAL;
+    }
+
+    *out = (size_t)parsed;
+    return 0;
+}
+
+static int parse_u16_option(const char* value, uint16_t* out)
+{
+    char* endptr = NULL;
+    unsigned long parsed = strtoul(value, &endptr, 10);
+
+    if (value[0] == '\0' || endptr == value || *endptr != '\0' || parsed == 0 || parsed > UINT16_MAX)
+    {
+        return EINVAL;
+    }
+
+    *out = (uint16_t)parsed;
+    return 0;
+}
+
+static int parse_run_config(int argc, char** argv, struct run_config* config_out)
+{
+    *config_out = {false,
+                   0,
+                   0,
+                   DefaultQueueDepth,
+                   DefaultMixedInflightDepth,
+                   DefaultStrongIsolatedHotInflightDepth,
+                   DefaultStrongIsolatedColdInflightDepth};
+
+    for (int i = 2; i < argc; ++i)
+    {
+        if (strcmp(argv[i], "--hot-budget") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->hot_budget) != 0)
+            {
+                fprintf(stderr, "Invalid value for --hot-budget.\n");
+                return EINVAL;
+            }
+            config_out->use_budget = true;
+        }
+        else if (strcmp(argv[i], "--cold-budget") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->cold_budget) != 0)
+            {
+                fprintf(stderr, "Invalid value for --cold-budget.\n");
+                return EINVAL;
+            }
+            config_out->use_budget = true;
+        }
+        else if (strcmp(argv[i], "--queue-depth") == 0 || strcmp(argv[i], "--queue_depth") == 0)
+        {
+            if (i + 1 >= argc || parse_u16_option(argv[++i], &config_out->queue_depth) != 0)
+            {
+                fprintf(stderr, "Invalid value for --queue-depth.\n");
+                return EINVAL;
+            }
+        }
+        else if (strcmp(argv[i], "--mixed-inflight") == 0 || strcmp(argv[i], "--mixed_inflight") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->mixed_inflight_depth) != 0
+                || config_out->mixed_inflight_depth == 0)
+            {
+                fprintf(stderr, "Invalid value for --mixed-inflight.\n");
+                return EINVAL;
+            }
+        }
+        else if (strcmp(argv[i], "--strong-hot-inflight") == 0 || strcmp(argv[i], "--strong_hot_inflight") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->strong_hot_inflight_depth) != 0
+                || config_out->strong_hot_inflight_depth == 0)
+            {
+                fprintf(stderr, "Invalid value for --strong-hot-inflight.\n");
+                return EINVAL;
+            }
+        }
+        else if (strcmp(argv[i], "--strong-cold-inflight") == 0 || strcmp(argv[i], "--strong_cold_inflight") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->strong_cold_inflight_depth) != 0
+                || config_out->strong_cold_inflight_depth == 0)
+            {
+                fprintf(stderr, "Invalid value for --strong-cold-inflight.\n");
+                return EINVAL;
+            }
+        }
+        else
+        {
+            fprintf(stderr,
+                    "Unknown option '%s'. Supported options: --hot-budget, --cold-budget, --queue-depth, --mixed-inflight, --strong-hot-inflight, --strong-cold-inflight\n",
+                    argv[i]);
+            return EINVAL;
+        }
+    }
+
+    return 0;
+}
+
+static size_t mixed_pending_depth_limit()
+{
+    return g_run_config.mixed_inflight_depth * MixedPendingDepthMultiplier;
+}
+
+static bool reserve_budget_slot(workload_type workload)
+{
+    if (!g_run_config.use_budget)
+    {
+        return true;
+    }
+
+    std::atomic<size_t>* counter = workload == WORKLOAD_HOT ? &g_hot_generated : &g_cold_generated;
+    size_t limit = workload == WORKLOAD_HOT ? g_run_config.hot_budget : g_run_config.cold_budget;
+    size_t current = counter->load(std::memory_order_relaxed);
+
+    while (current < limit)
+    {
+        if (counter->compare_exchange_weak(current,
+                                           current + 1,
+                                           std::memory_order_relaxed,
+                                           std::memory_order_relaxed))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool budgets_exhausted(experiment_mode mode)
+{
+    if (!g_run_config.use_budget)
+    {
+        return false;
+    }
+
+    bool hot_done = g_hot_generated.load(std::memory_order_relaxed) >= g_run_config.hot_budget;
+    bool cold_done = g_cold_generated.load(std::memory_order_relaxed) >= g_run_config.cold_budget;
+
+    if (mode == MODE_HOT_ONLY)
+    {
+        return hot_done;
+    }
+
+    return hot_done && cold_done;
 }
 
 static experiment_mode parse_mode(int argc, char** argv)
@@ -562,7 +736,7 @@ static void dispatch_thread(struct dispatch_group_state* group,
     struct mixed_dispatch_request pending = {};
     size_t inflight_count = 0;
     int status = 0;
-    uint16_t next_cid = 0;
+    uint16_t next_cid = 1;
     size_t sq_pages = NVM_SQ_PAGES(group->qp->sq->qmem.dma, group->qp->sq->queue.qs);
 
     if (inflight_target >= group->qp->sq->queue.qs)
@@ -621,6 +795,19 @@ static void dispatch_thread(struct dispatch_group_state* group,
                         "[Dispatcher] submit failed for thread %zu: %s\n",
                         pending.thread_index,
                         nvm_strerror(status));
+                return;
+            }
+
+            if (cid >= inflight.size())
+            {
+                if (pending.stats != NULL && pending.stats->error_status == 0)
+                {
+                    pending.stats->error_status = ERANGE;
+                }
+                fprintf(stderr,
+                        "[Dispatcher] returned cid=%u exceeds inflight slots=%zu\n",
+                        cid,
+                        inflight.size());
                 return;
             }
 
@@ -735,9 +922,17 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             struct mixed_dispatch_request request = {};
             struct dispatch_group_state* group = &kthread->dispatch_groups[
                 kthread->dispatch_group_base + (route_count % kthread->dispatch_group_count)];
+            workload_type target_workload = (mode == MODE_HOT_ONLY)
+                ? WORKLOAD_HOT
+                : kthread->workload;
+
+            if (!reserve_budget_slot(target_workload))
+            {
+                break;
+            }
 
             request.valid = true;
-            request.is_hot = (mode == MODE_HOT_ONLY) ? true : (kthread->workload == WORKLOAD_HOT);
+            request.is_hot = (target_workload == WORKLOAD_HOT);
             request.buffer = request.is_hot ? dma_buffer : (dma_buffer_cold != NULL ? dma_buffer_cold : dma_buffer);
             request.info = request.is_hot ? info : (info_cold != NULL ? info_cold : info);
             request.stats = stats;
@@ -748,7 +943,7 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             std::unique_lock<std::mutex> lock(group->mutex);
             group->can_push.wait(lock, [group]() {
                 return !keep_running.load() ||
-                       pending_count_locked(group) < MixedPendingDepthPerGroup;
+                       pending_count_locked(group) < mixed_pending_depth_limit();
             });
 
             if (!keep_running.load())
@@ -779,6 +974,11 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             struct timespec end_time;
             double elapsed_us;
             int status;
+
+            if (!reserve_budget_slot(kthread->workload))
+            {
+                break;
+            }
 
             clock_gettime(CLOCK_MONOTONIC, &start_time);
             status = pure_read(disk, qp, dma_buffer, info);
@@ -829,6 +1029,10 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             bool is_hot;
 
             is_hot = count % 4 == 0;
+            if (!reserve_budget_slot(is_hot ? WORKLOAD_HOT : WORKLOAD_COLD))
+            {
+                break;
+            }
             if(is_hot)
             {
                 clock_gettime(CLOCK_MONOTONIC, &start_time);
@@ -917,6 +1121,14 @@ int main(int argc, char** argv)
     int cold_error_count = 0;
     uint64_t run_start_ns = 0;
     uint64_t run_end_ns = 0;
+
+    status = parse_run_config(argc, argv, &g_run_config);
+    if (status != 0)
+    {
+        return 1;
+    }
+    g_hot_generated.store(0, std::memory_order_relaxed);
+    g_cold_generated.store(0, std::memory_order_relaxed);
     // 1. 初始化控制节点与分配队列 (沿用你跑通的逻辑)
     snvme_c_fd = open(snvme_control_path, O_RDWR); 
     if (snvme_c_fd < 0)
@@ -959,20 +1171,20 @@ int main(int argc, char** argv)
 
     ctrl->cq_num = TotalThread;
     ctrl->sq_num = TotalThread;
-    ctrl->qs = RequiredQueueDepth;
+    ctrl->qs = g_run_config.queue_depth;
 
     unsigned int module_qs = 0;
     status = read_module_io_queue_depth(&module_qs);
     if(status == 0)
     {
-        if(module_qs != RequiredQueueDepth)
+        if(module_qs != g_run_config.queue_depth)
         {
             fprintf(stderr,
                     "Queue depth mismatch: module io_queue_depth=%u, benchmark expects %u.\n"
                     "Please reload module with: sudo insmod snvme.ko io_queue_depth=%u\n",
                     module_qs,
-                    RequiredQueueDepth,
-                    RequiredQueueDepth);
+                    g_run_config.queue_depth,
+                    g_run_config.queue_depth);
             goto out;
         }
     }
@@ -1290,10 +1502,11 @@ int main(int argc, char** argv)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_MIXED_RATIO;
-            dispatch_groups[i].inflight_target = MixedInflightDepth;
+            dispatch_groups[i].inflight_target = g_run_config.mixed_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        printf("Mixed mode runs 4 hot producer threads and 12 cold producer threads over 16 shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals.\n");
+        printf("Mixed mode runs 4 hot producer threads and 12 cold producer threads over 16 shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals. Mixed inflight=%zu per queue pair.\n",
+               g_run_config.mixed_inflight_depth);
     }
     else if (mode == MODE_HOT_ONLY)
     {
@@ -1301,10 +1514,11 @@ int main(int argc, char** argv)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
-            dispatch_groups[i].inflight_target = MixedInflightDepth;
+            dispatch_groups[i].inflight_target = g_run_config.mixed_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        printf("Hot-only mode runs 16 hot producer threads over 16 shared queue pairs with the same dispatcher structure as mixed, but generates only hot requests.\n");
+        printf("Hot-only mode runs 16 hot producer threads over 16 shared queue pairs with the same dispatcher structure as mixed, but generates only hot requests. Mixed inflight=%zu per queue pair.\n",
+               g_run_config.mixed_inflight_depth);
     }
     else if (mode == MODE_WEAK_MIXED)
     {
@@ -1316,25 +1530,37 @@ int main(int argc, char** argv)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
-            dispatch_groups[i].inflight_target = StrongIsolatedHotInflightDepth;
+            dispatch_groups[i].inflight_target = g_run_config.strong_hot_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
         for (i = HotThread; i < TotalThread; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
-            dispatch_groups[i].inflight_target = StrongIsolatedColdInflightDepth;
+            dispatch_groups[i].inflight_target = g_run_config.strong_cold_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
         printf("Strong-isolated mode keeps 4 hot producer threads and 12 cold producer threads, but dispatches them through isolated hot queues 0-3 and isolated cold queues 4-15 with hot depth=%zu and cold depth=%zu per queue pair.\n",
-               StrongIsolatedHotInflightDepth,
-               StrongIsolatedColdInflightDepth);
+               g_run_config.strong_hot_inflight_depth,
+               g_run_config.strong_cold_inflight_depth);
     }
     else
     {
         printf("Isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data.\n");
     }
-    printf("Timed run: %u s\n", TestDurationSeconds);
+    if (g_run_config.use_budget)
+    {
+        printf("Budget run: hot=%zu, cold=%zu\n", g_run_config.hot_budget, g_run_config.cold_budget);
+    }
+    else
+    {
+        printf("Timed run: %u s\n", TestDurationSeconds);
+    }
+    printf("Queue depth: %u\n", g_run_config.queue_depth);
+    printf("Mixed inflight: %zu | Strong hot inflight: %zu | Strong cold inflight: %zu\n",
+           g_run_config.mixed_inflight_depth,
+           g_run_config.strong_hot_inflight_depth,
+           g_run_config.strong_cold_inflight_depth);
 
     keep_running = true;
     run_start_ns = monotonic_time_ns();
@@ -1370,8 +1596,19 @@ int main(int argc, char** argv)
         
     }
 
-    sleep(TestDurationSeconds);
-    keep_running = false;
+    if (g_run_config.use_budget)
+    {
+        while (!budgets_exhausted(mode))
+        {
+            usleep(1000);
+        }
+        keep_running = false;
+    }
+    else
+    {
+        sleep(TestDurationSeconds);
+        keep_running = false;
+    }
 
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
