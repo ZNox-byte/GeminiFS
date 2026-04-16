@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -140,9 +141,9 @@ static int request_queues(nvm_ctrl_t* ctrl, struct queue** queues)
 }
 
 
-static constexpr size_t TotalThread = 16;
-static constexpr size_t HotThread = 4;
-static constexpr size_t ColdThread = TotalThread - HotThread;
+static constexpr size_t MaxThreadCount = 16;
+static constexpr size_t DefaultHotThreadCount = 4;
+static constexpr size_t DefaultColdThreadCount = MaxThreadCount - DefaultHotThreadCount;
 static constexpr size_t hot_piece_size = 4096;
 static constexpr size_t cold_piece_size = 128 * 1024;
 static constexpr uint64_t Hot_ofst = 4096;
@@ -151,10 +152,9 @@ static constexpr size_t SeedFilseSize  = 16 * 1024 * 1024;
 static constexpr useconds_t HotThinkTime = 50;
 static constexpr useconds_t ColdThinkTime = 1000;
 static constexpr size_t LatencyCapacility = 100000;
-static constexpr unsigned int TestDurationSeconds = 5;
+static constexpr unsigned int DefaultTestDurationSeconds = 5;
 static constexpr size_t DefaultMixedInflightDepth = 16;
 static constexpr size_t MixedPendingDepthMultiplier = 8;
-static constexpr size_t MixedQueueCount = TotalThread;
 static constexpr size_t DefaultStrongIsolatedHotInflightDepth = 16;
 static constexpr size_t DefaultStrongIsolatedColdInflightDepth = 8;
 static constexpr uint16_t DefaultQueueDepth = 128;
@@ -169,6 +169,11 @@ struct run_config
     size_t mixed_inflight_depth;
     size_t strong_hot_inflight_depth;
     size_t strong_cold_inflight_depth;
+    unsigned int duration_seconds;
+    size_t hot_threads;
+    size_t cold_threads;
+    bool hot_threads_overridden;
+    bool cold_threads_overridden;
 };
 
 static struct run_config g_run_config = {false,
@@ -177,7 +182,12 @@ static struct run_config g_run_config = {false,
                                          DefaultQueueDepth,
                                          DefaultMixedInflightDepth,
                                          DefaultStrongIsolatedHotInflightDepth,
-                                         DefaultStrongIsolatedColdInflightDepth};
+                                         DefaultStrongIsolatedColdInflightDepth,
+                                         DefaultTestDurationSeconds,
+                                         DefaultHotThreadCount,
+                                         DefaultColdThreadCount,
+                                         false,
+                                         false};
 static std::atomic<size_t> g_hot_generated(0);
 static std::atomic<size_t> g_cold_generated(0);
 
@@ -408,6 +418,20 @@ static int parse_u16_option(const char* value, uint16_t* out)
     return 0;
 }
 
+static int parse_u32_option(const char* value, unsigned int* out)
+{
+    char* endptr = NULL;
+    unsigned long parsed = strtoul(value, &endptr, 10);
+
+    if (value[0] == '\0' || endptr == value || *endptr != '\0' || parsed == 0 || parsed > UINT_MAX)
+    {
+        return EINVAL;
+    }
+
+    *out = (unsigned int)parsed;
+    return 0;
+}
+
 static int parse_run_config(int argc, char** argv, struct run_config* config_out)
 {
     *config_out = {false,
@@ -416,7 +440,12 @@ static int parse_run_config(int argc, char** argv, struct run_config* config_out
                    DefaultQueueDepth,
                    DefaultMixedInflightDepth,
                    DefaultStrongIsolatedHotInflightDepth,
-                   DefaultStrongIsolatedColdInflightDepth};
+                   DefaultStrongIsolatedColdInflightDepth,
+                   DefaultTestDurationSeconds,
+                   DefaultHotThreadCount,
+                   DefaultColdThreadCount,
+                   false,
+                   false};
 
     for (int i = 2; i < argc; ++i)
     {
@@ -445,6 +474,34 @@ static int parse_run_config(int argc, char** argv, struct run_config* config_out
                 fprintf(stderr, "Invalid value for --queue-depth.\n");
                 return EINVAL;
             }
+        }
+        else if (strcmp(argv[i], "--duration") == 0)
+        {
+            if (i + 1 >= argc || parse_u32_option(argv[++i], &config_out->duration_seconds) != 0)
+            {
+                fprintf(stderr, "Invalid value for --duration.\n");
+                return EINVAL;
+            }
+        }
+        else if (strcmp(argv[i], "--hot-threads") == 0 || strcmp(argv[i], "--hot_threads") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->hot_threads) != 0
+                || config_out->hot_threads > MaxThreadCount)
+            {
+                fprintf(stderr, "Invalid value for --hot-threads.\n");
+                return EINVAL;
+            }
+            config_out->hot_threads_overridden = true;
+        }
+        else if (strcmp(argv[i], "--cold-threads") == 0 || strcmp(argv[i], "--cold_threads") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->cold_threads) != 0
+                || config_out->cold_threads > MaxThreadCount)
+            {
+                fprintf(stderr, "Invalid value for --cold-threads.\n");
+                return EINVAL;
+            }
+            config_out->cold_threads_overridden = true;
         }
         else if (strcmp(argv[i], "--mixed-inflight") == 0 || strcmp(argv[i], "--mixed_inflight") == 0)
         {
@@ -476,12 +533,54 @@ static int parse_run_config(int argc, char** argv, struct run_config* config_out
         else
         {
             fprintf(stderr,
-                    "Unknown option '%s'. Supported options: --hot-budget, --cold-budget, --queue-depth, --mixed-inflight, --strong-hot-inflight, --strong-cold-inflight\n",
+                    "Unknown option '%s'. Supported options: --hot-budget, --cold-budget, --queue-depth, --duration, --hot-threads, --cold-threads, --mixed-inflight, --strong-hot-inflight, --strong-cold-inflight\n",
                     argv[i]);
             return EINVAL;
         }
     }
 
+    return 0;
+}
+
+static int resolve_thread_layout(experiment_mode mode,
+                                 const struct run_config* config,
+                                 size_t* hot_threads_out,
+                                 size_t* cold_threads_out,
+                                 size_t* active_threads_out)
+{
+    size_t hot_threads = config->hot_threads_overridden ? config->hot_threads
+                                                        : (mode == MODE_HOT_ONLY ? MaxThreadCount
+                                                                                 : DefaultHotThreadCount);
+    size_t cold_threads = config->cold_threads_overridden ? config->cold_threads
+                                                          : (mode == MODE_HOT_ONLY ? 0
+                                                                                   : DefaultColdThreadCount);
+
+    if (mode == MODE_HOT_ONLY && config->cold_threads_overridden && cold_threads != 0)
+    {
+        fprintf(stderr, "--cold-threads is not supported in hot-only mode.\n");
+        return EINVAL;
+    }
+
+    if (hot_threads == 0)
+    {
+        fprintf(stderr, "--hot-threads must be at least 1.\n");
+        return EINVAL;
+    }
+
+    size_t active_threads = mode == MODE_HOT_ONLY ? hot_threads : (hot_threads + cold_threads);
+    if (active_threads == 0 || active_threads > MaxThreadCount)
+    {
+        fprintf(stderr,
+                "Invalid thread layout: hot=%zu cold=%zu exceeds max supported producers=%zu.\n",
+                hot_threads,
+                cold_threads,
+                MaxThreadCount);
+        return EINVAL;
+    }
+
+    *hot_threads_out = hot_threads;
+    *cold_threads_out = mode == MODE_HOT_ONLY ? 0 : cold_threads;
+    *active_threads_out = active_threads;
     return 0;
 }
 
@@ -1087,26 +1186,26 @@ int main(int argc, char** argv)
     experiment_mode mode = parse_mode(argc, argv);
     nvm_ctrl_t* ctrl = NULL;
     struct disk disk;
-    struct buffer buffers[TotalThread] = {};
-    struct buffer buffers_cold[TotalThread] = {};
-    bool buffer_ready[TotalThread] = {};
-    bool buffer_ready_cold[TotalThread] = {};
+    struct buffer buffers[MaxThreadCount] = {};
+    struct buffer buffers_cold[MaxThreadCount] = {};
+    bool buffer_ready[MaxThreadCount] = {};
+    bool buffer_ready_cold[MaxThreadCount] = {};
     int snvme_c_fd = -1, snvme_d_fd = -1, snvme_helper_fd = -1, fd = -1;
-    uint64_t nvme_ofst[TotalThread] = {};
-    uint64_t nvme_ofst_cold[TotalThread] = {};
+    uint64_t nvme_ofst[MaxThreadCount] = {};
+    uint64_t nvme_ofst_cold[MaxThreadCount] = {};
     int ret, status;
     bool mounted = false;
     char* dummy_buf = NULL;
-    struct queue_pair qps[TotalThread] = {};
-    struct file_info infos[TotalThread] = {};
-    struct file_info infos_cold[TotalThread] = {};
-    struct latency_log hot_latencies[TotalThread] = {};
-    struct work_args work_threads[TotalThread] = {};
-    struct thread_stats stats_for_thread[TotalThread] = {};
-    struct dispatch_group_state dispatch_groups[TotalThread] = {};
+    struct queue_pair qps[MaxThreadCount] = {};
+    struct file_info infos[MaxThreadCount] = {};
+    struct file_info infos_cold[MaxThreadCount] = {};
+    struct latency_log hot_latencies[MaxThreadCount] = {};
+    struct work_args work_threads[MaxThreadCount] = {};
+    struct thread_stats stats_for_thread[MaxThreadCount] = {};
+    struct dispatch_group_state dispatch_groups[MaxThreadCount] = {};
 
-    std::thread workers[TotalThread];
-    std::thread dispatchers[TotalThread];
+    std::thread workers[MaxThreadCount];
+    std::thread dispatchers[MaxThreadCount];
 
     double avg;
     double p95;
@@ -1121,12 +1220,24 @@ int main(int argc, char** argv)
     int cold_error_count = 0;
     uint64_t run_start_ns = 0;
     uint64_t run_end_ns = 0;
+    size_t hot_thread_count = 0;
+    size_t cold_thread_count = 0;
+    size_t active_thread_count = 0;
+    bool use_legacy_isolated_layout = false;
 
     status = parse_run_config(argc, argv, &g_run_config);
     if (status != 0)
     {
         return 1;
     }
+    status = resolve_thread_layout(mode, &g_run_config, &hot_thread_count, &cold_thread_count, &active_thread_count);
+    if (status != 0)
+    {
+        return 1;
+    }
+    use_legacy_isolated_layout = (hot_thread_count == DefaultHotThreadCount
+                               && cold_thread_count == DefaultColdThreadCount
+                               && active_thread_count == MaxThreadCount);
     g_hot_generated.store(0, std::memory_order_relaxed);
     g_cold_generated.store(0, std::memory_order_relaxed);
     // 1. 初始化控制节点与分配队列 (沿用你跑通的逻辑)
@@ -1169,8 +1280,8 @@ int main(int argc, char** argv)
     snvme_c_fd = -1;
     snvme_d_fd = -1;
 
-    ctrl->cq_num = TotalThread;
-    ctrl->sq_num = TotalThread;
+    ctrl->cq_num = active_thread_count;
+    ctrl->sq_num = active_thread_count;
     ctrl->qs = g_run_config.queue_depth;
 
     unsigned int module_qs = 0;
@@ -1210,9 +1321,9 @@ int main(int argc, char** argv)
     }
     if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for(i = 0; i < TotalThread; i++)
+        for(i = 0; i < active_thread_count; i++)
         {
-            if(mode == MODE_HOT_ONLY || i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < hot_thread_count)
             {
                 status = create_buffer(&buffers[i], ctrl, hot_piece_size, 0, -1);
             }
@@ -1230,7 +1341,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        for(i = 0; i < TotalThread; i++)
+        for(i = 0; i < active_thread_count; i++)
         {
             status = create_buffer(&buffers[i], ctrl, hot_piece_size, 0, -1);
             if (status != 0)
@@ -1318,9 +1429,9 @@ int main(int argc, char** argv)
     }
     if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for(int i = 0; i < TotalThread; i++)
+        for(int i = 0; i < (int)active_thread_count; i++)
         {
-            if(mode == MODE_HOT_ONLY || i < HotThread)
+            if(mode == MODE_HOT_ONLY || (size_t)i < hot_thread_count)
             {
                 status = map_file_offset(snvme_helper_fd, fd, Hot_ofst + i * hot_piece_size, hot_piece_size, &nvme_ofst[i]);
                 if (status != 0)
@@ -1331,7 +1442,7 @@ int main(int argc, char** argv)
             }
             else
             {
-                status = map_file_offset(snvme_helper_fd, fd, Cold_ofst + (i - HotThread) * cold_piece_size, cold_piece_size, &nvme_ofst[i]);
+                status = map_file_offset(snvme_helper_fd, fd, Cold_ofst + (i - (int)hot_thread_count) * cold_piece_size, cold_piece_size, &nvme_ofst[i]);
                 if (status != 0)
                 {
                     fprintf(stderr, "Failed to map Cold file offset for thread %d: %s\n", i, strerror(status));
@@ -1342,7 +1453,7 @@ int main(int argc, char** argv)
     }
     else
     {
-        for(int i = 0; i < TotalThread; i++)
+        for(int i = 0; i < (int)active_thread_count; i++)
         {
 
             status = map_file_offset(snvme_helper_fd, fd, Hot_ofst + i * hot_piece_size, hot_piece_size, &nvme_ofst[i]);
@@ -1363,18 +1474,20 @@ int main(int argc, char** argv)
     close(snvme_helper_fd);
     snvme_helper_fd = -1;
 
-    for(i = 0; i < TotalThread; i++)
+    for(i = 0; i < active_thread_count; i++)
     {
         size_t queue_index;
         if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
         {
-            if(mode == MODE_HOT_ONLY || i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < hot_thread_count)
             {
-                queue_index = i * 4;
+                queue_index = use_legacy_isolated_layout ? (i * 4) : i;
             }
             else
             {
-                queue_index = ((i - HotThread) % 3) + ((i - HotThread) / 3) * 4 + 1;
+                queue_index = use_legacy_isolated_layout
+                    ? (((i - hot_thread_count) % 3) + ((i - hot_thread_count) / 3) * 4 + 1)
+                    : i;
             }
         }
         else
@@ -1398,7 +1511,7 @@ int main(int argc, char** argv)
         infos[i].queue_size = ctrl->qs;
         if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
         {
-            if(mode == MODE_HOT_ONLY || i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < hot_thread_count)
             {
                 infos[i].num_blocks = hot_piece_size >> 9;
                 infos[i].chunk_size = hot_piece_size;
@@ -1408,7 +1521,7 @@ int main(int argc, char** argv)
                 infos[i].num_blocks = cold_piece_size >> 9;
                 infos[i].chunk_size = cold_piece_size;
             }
-            if(mode == MODE_HOT_ONLY || i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < hot_thread_count)
             {
                 status = latency_log_init(&hot_latencies[i], LatencyCapacility);
                 if (status != 0)
@@ -1449,10 +1562,10 @@ int main(int argc, char** argv)
         {
             work_threads[i].dma_buffer_cold = buffers_cold[i].dma;
             work_threads[i].info_cold = &infos_cold[i];
-            work_threads[i].latencies = (i < HotThread) ? &hot_latencies[i] : NULL;
-            work_threads[i].workload = (i < HotThread) ? WORKLOAD_HOT : WORKLOAD_COLD;
+            work_threads[i].latencies = (i < hot_thread_count) ? &hot_latencies[i] : NULL;
+            work_threads[i].workload = (i < hot_thread_count) ? WORKLOAD_HOT : WORKLOAD_COLD;
             work_threads[i].dispatch_group_base = 0;
-            work_threads[i].dispatch_group_count = MixedQueueCount;
+            work_threads[i].dispatch_group_count = active_thread_count;
         }
         else if(mode == MODE_HOT_ONLY)
         {
@@ -1461,7 +1574,7 @@ int main(int argc, char** argv)
             work_threads[i].latencies = &hot_latencies[i];
             work_threads[i].workload = WORKLOAD_HOT;
             work_threads[i].dispatch_group_base = 0;
-            work_threads[i].dispatch_group_count = MixedQueueCount;
+            work_threads[i].dispatch_group_count = active_thread_count;
         }
         else if(mode == MODE_WEAK_MIXED)
         {
@@ -1471,14 +1584,14 @@ int main(int argc, char** argv)
         }
         else
         {
-            if(i < HotThread)
+            if(i < hot_thread_count)
             {
                 work_threads[i].dma_buffer_cold = NULL;
                 work_threads[i].info_cold = NULL;
                 work_threads[i].latencies = &hot_latencies[i];
                 work_threads[i].workload = WORKLOAD_HOT;
                 work_threads[i].dispatch_group_base = 0;
-                work_threads[i].dispatch_group_count = HotThread;
+                work_threads[i].dispatch_group_count = hot_thread_count;
             }
             else
             {
@@ -1488,8 +1601,8 @@ int main(int argc, char** argv)
                 work_threads[i].workload = WORKLOAD_COLD;
                 if (mode == MODE_STRONG_ISOLATED)
                 {
-                    work_threads[i].dispatch_group_base = HotThread;
-                    work_threads[i].dispatch_group_count = ColdThread;
+                    work_threads[i].dispatch_group_base = hot_thread_count;
+                    work_threads[i].dispatch_group_count = cold_thread_count;
                 }
             }
         }
@@ -1498,26 +1611,31 @@ int main(int argc, char** argv)
 
     if (mode == MODE_MIXED)
     {
-        for (i = 0; i < MixedQueueCount; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_MIXED_RATIO;
             dispatch_groups[i].inflight_target = g_run_config.mixed_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        printf("Mixed mode runs 4 hot producer threads and 12 cold producer threads over 16 shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals. Mixed inflight=%zu per queue pair.\n",
+        printf("Mixed mode runs %zu hot producer threads and %zu cold producer threads over %zu shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals. Mixed inflight=%zu per queue pair.\n",
+               hot_thread_count,
+               cold_thread_count,
+               active_thread_count,
                g_run_config.mixed_inflight_depth);
     }
     else if (mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < MixedQueueCount; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
             dispatch_groups[i].inflight_target = g_run_config.mixed_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        printf("Hot-only mode runs 16 hot producer threads over 16 shared queue pairs with the same dispatcher structure as mixed, but generates only hot requests. Mixed inflight=%zu per queue pair.\n",
+        printf("Hot-only mode runs %zu hot producer threads over %zu shared queue pairs with the same dispatcher structure as mixed, but generates only hot requests. Mixed inflight=%zu per queue pair.\n",
+               hot_thread_count,
+               active_thread_count,
                g_run_config.mixed_inflight_depth);
     }
     else if (mode == MODE_WEAK_MIXED)
@@ -1526,21 +1644,23 @@ int main(int argc, char** argv)
     }
     else if (mode == MODE_STRONG_ISOLATED)
     {
-        for (i = 0; i < HotThread; ++i)
+        for (i = 0; i < hot_thread_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
             dispatch_groups[i].inflight_target = g_run_config.strong_hot_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        for (i = HotThread; i < TotalThread; ++i)
+        for (i = hot_thread_count; i < active_thread_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
             dispatch_groups[i].inflight_target = g_run_config.strong_cold_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        printf("Strong-isolated mode keeps 4 hot producer threads and 12 cold producer threads, but dispatches them through isolated hot queues 0-3 and isolated cold queues 4-15 with hot depth=%zu and cold depth=%zu per queue pair.\n",
+        printf("Strong-isolated mode keeps %zu hot producer threads and %zu cold producer threads, dispatching them through isolated queue pairs with hot depth=%zu and cold depth=%zu per queue pair.\n",
+               hot_thread_count,
+               cold_thread_count,
                g_run_config.strong_hot_inflight_depth,
                g_run_config.strong_cold_inflight_depth);
     }
@@ -1554,9 +1674,13 @@ int main(int argc, char** argv)
     }
     else
     {
-        printf("Timed run: %u s\n", TestDurationSeconds);
+        printf("Timed run: %u s\n", g_run_config.duration_seconds);
     }
     printf("Queue depth: %u\n", g_run_config.queue_depth);
+    printf("Hot threads: %zu | Cold threads: %zu | Active producers: %zu\n",
+           hot_thread_count,
+           cold_thread_count,
+           active_thread_count);
     printf("Mixed inflight: %zu | Strong hot inflight: %zu | Strong cold inflight: %zu\n",
            g_run_config.mixed_inflight_depth,
            g_run_config.strong_hot_inflight_depth,
@@ -1567,7 +1691,7 @@ int main(int argc, char** argv)
 
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < TotalThread; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             try
             {
@@ -1581,7 +1705,7 @@ int main(int argc, char** argv)
         }
     }
 
-    for(int i = 0; i < TotalThread; i++)
+    for(int i = 0; i < (int)active_thread_count; i++)
     {
         try
         {
@@ -1590,7 +1714,7 @@ int main(int argc, char** argv)
         }
         catch (const std::system_error& e)
         {
-            fprintf(stderr, "Failed to start worker thread %zu: %s\n", i, e.what());
+            fprintf(stderr, "Failed to start worker thread %d: %s\n", i, e.what());
             goto out;
         }
         
@@ -1606,27 +1730,27 @@ int main(int argc, char** argv)
     }
     else
     {
-        sleep(TestDurationSeconds);
+        sleep(g_run_config.duration_seconds);
         keep_running = false;
     }
 
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < TotalThread; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             dispatch_groups[i].can_push.notify_all();
             dispatch_groups[i].can_pop.notify_all();
         }
     }
 
-    for(int i = 0; i < TotalThread; i++)
+    for(int i = 0; i < (int)active_thread_count; i++)
     {
         if(workers[i].joinable())
             workers[i].join();
     }
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < TotalThread; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             if (dispatchers[i].joinable())
             {
@@ -1635,7 +1759,7 @@ int main(int argc, char** argv)
         }
     }
     run_end_ns = monotonic_time_ns();
-    for(i = 0; i < TotalThread; i++)
+    for(i = 0; i < active_thread_count; i++)
     {
         qps[i].stop = true;
     }
@@ -1647,14 +1771,14 @@ int main(int argc, char** argv)
         elapsed_seconds = 1e-9;
     }
 
-    for(int i = 0; i < TotalThread; i++)
+    for(int i = 0; i < (int)active_thread_count; i++)
     {
         total_hot_ios += stats_for_thread[i].hot_io_count;
         total_cold_ios += stats_for_thread[i].cold_io_count;
 
         if(mode == MODE_ISOLATED || mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
         {
-            if(i < HotThread)
+            if((size_t)i < hot_thread_count)
             {
                 if (stats_for_thread[i].error_status != 0)
                 {
@@ -1716,8 +1840,8 @@ int main(int argc, char** argv)
             printf("WARNING: completion errors detected, this latency sample is invalid for comparison.\n");
         }
         // printf("Mode: %s\n", mode_name(mode));
-        size_t report_hot_threads = (mode == MODE_HOT_ONLY) ? TotalThread : HotThread;
-        size_t report_cold_threads = (mode == MODE_HOT_ONLY) ? 0 : ColdThread;
+        size_t report_hot_threads = (mode == MODE_HOT_ONLY) ? hot_thread_count : hot_thread_count;
+        size_t report_cold_threads = (mode == MODE_HOT_ONLY) ? 0 : cold_thread_count;
         printf("Hot Threads: %zu, Cold Threads: %zu\n", report_hot_threads, report_cold_threads);
         printf("Elapsed Time: %.3f s\n", elapsed_seconds);
         printf("Total Hot Requests: %zu\n", all_hot_latencies.size());
@@ -1737,7 +1861,7 @@ int main(int argc, char** argv)
     Host_file_system_exit(nvme_mount_path);
     mounted = false;
     // printf("cleanup: start remove_buffer on normal path\n");
-    for (i = 0; i < TotalThread; ++i)
+    for (i = 0; i < MaxThreadCount; ++i)
     {
         if (buffer_ready[i])
         {
@@ -1748,7 +1872,7 @@ int main(int argc, char** argv)
             remove_buffer(&buffers_cold[i]);
         }
     }
-    for (i = 0; i < TotalThread; ++i)
+    for (i = 0; i < MaxThreadCount; ++i)
     {
         latency_log_destroy(&hot_latencies[i]);
     }
@@ -1761,19 +1885,19 @@ out:
     keep_running = false;
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < TotalThread; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             dispatch_groups[i].can_push.notify_all();
             dispatch_groups[i].can_pop.notify_all();
         }
     }
-    for (i = 0; i < TotalThread; ++i)
+    for (i = 0; i < active_thread_count; ++i)
     {
         qps[i].stop = true;
     }
     if (any_thread_started)
     {
-        for (i = 0; i < TotalThread; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             if (workers[i].joinable())
             {
@@ -1781,9 +1905,9 @@ out:
             }
         }
     }
-    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < TotalThread; ++i)
+        for (i = 0; i < active_thread_count; ++i)
         {
             if (dispatchers[i].joinable())
             {
@@ -1813,7 +1937,7 @@ out:
         Host_file_system_exit(nvme_mount_path);
     }
     // printf("cleanup: start remove_buffer on error path\n");
-    for (i = 0; i < TotalThread; ++i)
+    for (i = 0; i < MaxThreadCount; ++i)
     {
         if (buffer_ready[i])
         {
@@ -1824,7 +1948,7 @@ out:
             remove_buffer(&buffers_cold[i]);
         }
     }
-    for (i = 0; i < TotalThread; ++i)
+    for (i = 0; i < MaxThreadCount; ++i)
     {
         latency_log_destroy(&hot_latencies[i]);
     }
