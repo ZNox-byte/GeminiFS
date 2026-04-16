@@ -54,6 +54,7 @@ enum experiment_mode
     MODE_MIXED = 1,
     MODE_WEAK_MIXED = 2,
     MODE_STRONG_ISOLATED = 3,
+    MODE_HOT_ONLY = 4,
 };
 
 static int map_file_offset(int helper_fd, int file_fd, uint64_t file_offset, uint64_t length, uint64_t* nvme_offset)
@@ -383,6 +384,11 @@ static experiment_mode parse_mode(int argc, char** argv)
     if (strcmp(argv[1], "strong-i") == 0)
     {
         return MODE_STRONG_ISOLATED;
+    }
+
+    if (strcmp(argv[1], "hot-only") == 0)
+    {
+        return MODE_HOT_ONLY;
     }
 
     fprintf(stderr, "Unknown mode '%s', fallback to isolated\n", argv[1]);
@@ -720,7 +726,7 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
     struct latency_log* latency = kthread->latencies;
     struct thread_stats* stats = kthread->stats;
 
-    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
         size_t route_count = 0;
 
@@ -731,7 +737,7 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
                 kthread->dispatch_group_base + (route_count % kthread->dispatch_group_count)];
 
             request.valid = true;
-            request.is_hot = kthread->workload == WORKLOAD_HOT;
+            request.is_hot = (mode == MODE_HOT_ONLY) ? true : (kthread->workload == WORKLOAD_HOT);
             request.buffer = request.is_hot ? dma_buffer : (dma_buffer_cold != NULL ? dma_buffer_cold : dma_buffer);
             request.info = request.is_hot ? info : (info_cold != NULL ? info_cold : info);
             request.stats = stats;
@@ -990,11 +996,11 @@ int main(int argc, char** argv)
         fprintf(stderr, "Failed to enable user I/O queues: %s\n", strerror(status));
         goto out;
     }
-    if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
+    if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
         for(i = 0; i < TotalThread; i++)
         {
-            if(i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < HotThread)
             {
                 status = create_buffer(&buffers[i], ctrl, hot_piece_size, 0, -1);
             }
@@ -1098,11 +1104,11 @@ int main(int argc, char** argv)
         perror("Failed to open helper device");
         goto out;
     }
-    if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
+    if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
         for(int i = 0; i < TotalThread; i++)
         {
-            if(i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < HotThread)
             {
                 status = map_file_offset(snvme_helper_fd, fd, Hot_ofst + i * hot_piece_size, hot_piece_size, &nvme_ofst[i]);
                 if (status != 0)
@@ -1150,7 +1156,7 @@ int main(int argc, char** argv)
         size_t queue_index;
         if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
         {
-            if(i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < HotThread)
             {
                 queue_index = i * 4;
             }
@@ -1161,7 +1167,7 @@ int main(int argc, char** argv)
         }
         else
         {
-            if (mode == MODE_MIXED)
+            if (mode == MODE_MIXED || mode == MODE_HOT_ONLY)
             {
                 queue_index = i;
             }
@@ -1178,9 +1184,9 @@ int main(int argc, char** argv)
         infos[i].offset = nvme_ofst[i] >> 9;
         infos[i].namespace_id = disk.ns_id;
         infos[i].queue_size = ctrl->qs;
-        if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
+        if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
         {
-            if(i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < HotThread)
             {
                 infos[i].num_blocks = hot_piece_size >> 9;
                 infos[i].chunk_size = hot_piece_size;
@@ -1190,7 +1196,7 @@ int main(int argc, char** argv)
                 infos[i].num_blocks = cold_piece_size >> 9;
                 infos[i].chunk_size = cold_piece_size;
             }
-            if(i < HotThread)
+            if(mode == MODE_HOT_ONLY || i < HotThread)
             {
                 status = latency_log_init(&hot_latencies[i], LatencyCapacility);
                 if (status != 0)
@@ -1233,6 +1239,15 @@ int main(int argc, char** argv)
             work_threads[i].info_cold = &infos_cold[i];
             work_threads[i].latencies = (i < HotThread) ? &hot_latencies[i] : NULL;
             work_threads[i].workload = (i < HotThread) ? WORKLOAD_HOT : WORKLOAD_COLD;
+            work_threads[i].dispatch_group_base = 0;
+            work_threads[i].dispatch_group_count = MixedQueueCount;
+        }
+        else if(mode == MODE_HOT_ONLY)
+        {
+            work_threads[i].dma_buffer_cold = NULL;
+            work_threads[i].info_cold = NULL;
+            work_threads[i].latencies = &hot_latencies[i];
+            work_threads[i].workload = WORKLOAD_HOT;
             work_threads[i].dispatch_group_base = 0;
             work_threads[i].dispatch_group_count = MixedQueueCount;
         }
@@ -1280,6 +1295,17 @@ int main(int argc, char** argv)
         }
         printf("Mixed mode runs 4 hot producer threads and 12 cold producer threads over 16 shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals.\n");
     }
+    else if (mode == MODE_HOT_ONLY)
+    {
+        for (i = 0; i < MixedQueueCount; ++i)
+        {
+            dispatch_groups[i].qp = &qps[i];
+            dispatch_groups[i].policy = DISPATCH_FIFO;
+            dispatch_groups[i].inflight_target = MixedInflightDepth;
+            dispatch_groups[i].issue_count = 0;
+        }
+        printf("Hot-only mode runs 16 hot producer threads over 16 shared queue pairs with the same dispatcher structure as mixed, but generates only hot requests.\n");
+    }
     else if (mode == MODE_WEAK_MIXED)
     {
         printf("Weak-mixed mode alternates hot/cold requests in the single-issue path.\n");
@@ -1313,7 +1339,7 @@ int main(int argc, char** argv)
     keep_running = true;
     run_start_ns = monotonic_time_ns();
 
-    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
         for (i = 0; i < TotalThread; ++i)
         {
@@ -1347,7 +1373,7 @@ int main(int argc, char** argv)
     sleep(TestDurationSeconds);
     keep_running = false;
 
-    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
         for (i = 0; i < TotalThread; ++i)
         {
@@ -1361,7 +1387,7 @@ int main(int argc, char** argv)
         if(workers[i].joinable())
             workers[i].join();
     }
-    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
         for (i = 0; i < TotalThread; ++i)
         {
@@ -1409,6 +1435,16 @@ int main(int argc, char** argv)
                 }
             }
         }
+        else if (mode == MODE_HOT_ONLY)
+        {
+            if (stats_for_thread[i].error_status != 0)
+            {
+                hot_error_count++;
+            }
+            all_hot_latencies.insert(all_hot_latencies.end(),
+                                     hot_latencies[i].values,
+                                     hot_latencies[i].values + hot_latencies[i].count);
+        }
         else
         {
             if (stats_for_thread[i].error_status != 0)
@@ -1443,7 +1479,9 @@ int main(int argc, char** argv)
             printf("WARNING: completion errors detected, this latency sample is invalid for comparison.\n");
         }
         // printf("Mode: %s\n", mode_name(mode));
-        printf("Hot Threads: %zu, Cold Threads: %zu\n", HotThread, ColdThread);
+        size_t report_hot_threads = (mode == MODE_HOT_ONLY) ? TotalThread : HotThread;
+        size_t report_cold_threads = (mode == MODE_HOT_ONLY) ? 0 : ColdThread;
+        printf("Hot Threads: %zu, Cold Threads: %zu\n", report_hot_threads, report_cold_threads);
         printf("Elapsed Time: %.3f s\n", elapsed_seconds);
         printf("Total Hot Requests: %zu\n", all_hot_latencies.size());
         printf("Average Latency: %.2f us\n", avg);
@@ -1484,7 +1522,7 @@ int main(int argc, char** argv)
     return 0;
 out:
     keep_running = false;
-    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
         for (i = 0; i < TotalThread; ++i)
         {
