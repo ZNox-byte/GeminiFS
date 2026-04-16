@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <nvm_types.h>
 #include <nvm_ctrl.h>
 #include <nvm_dma.h>
@@ -14,11 +18,14 @@
 #include <vector>
 #include <algorithm>
 #include <thread>
+#include <chrono>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <system_error>
 #include <nvm_util.h>
 #include <nvm_queue.h>
 #include <nvm_cmd.h>
-#include <sched.h>
 
 #include "get-offset/get-offset.h"
 #include "integrity.h"
@@ -145,7 +152,12 @@ static constexpr useconds_t ColdThinkTime = 1000;
 static constexpr size_t LatencyCapacility = 100000;
 static constexpr unsigned int TestDurationSeconds = 5;
 static constexpr size_t MixedInflightDepth = 16;
+static constexpr size_t MixedPendingDepthPerGroup = MixedInflightDepth * 8;
+static constexpr size_t MixedQueueCount = TotalThread;
+static constexpr size_t StrongIsolatedHotInflightDepth = 16;
+static constexpr size_t StrongIsolatedColdInflightDepth = 8;
 static constexpr uint16_t RequiredQueueDepth = 64;
+static constexpr size_t DispatchCidCount = 1u << 16;
 
 struct latency_log
 {
@@ -158,11 +170,46 @@ struct inflight_request
 {
     bool valid;
     bool is_hot;
+    struct timespec issue_time;
     struct timespec submit_time;
+    struct thread_stats* owner_stats;
+    struct latency_log* owner_latency;
+    size_t owner_thread_index;
     uint8_t opcode;
     uint32_t nsid;
     uint64_t slba;
     uint16_t nblocks;
+};
+
+struct mixed_dispatch_request
+{
+    bool valid;
+    bool is_hot;
+    struct timespec issue_time;
+    const nvm_dma_t* buffer;
+    const struct file_info* info;
+    struct thread_stats* stats;
+    struct latency_log* latency;
+    size_t thread_index;
+};
+
+enum dispatch_policy
+{
+    DISPATCH_FIFO = 0,
+    DISPATCH_MIXED_RATIO = 1
+};
+
+struct dispatch_group_state
+{
+    struct queue_pair* qp;
+    dispatch_policy policy;
+    size_t inflight_target;
+    std::mutex mutex;
+    std::condition_variable can_push;
+    std::condition_variable can_pop;
+    std::deque<struct mixed_dispatch_request> hot_pending;
+    std::deque<struct mixed_dispatch_request> cold_pending;
+    size_t issue_count;
 };
 
 
@@ -177,6 +224,9 @@ struct work_args
 {
     size_t thread_index;
     workload_type workload;
+    struct dispatch_group_state* dispatch_groups;
+    size_t dispatch_group_base;
+    size_t dispatch_group_count;
     struct disk* disk;
     struct queue_pair* qp;
     nvm_dma_t* dma_buffer;
@@ -254,6 +304,60 @@ static double percentile_value(const std::vector<double>& log, double percentile
     return log[index];
 }
 
+static size_t pending_count_locked(const struct dispatch_group_state* group)
+{
+    return group->hot_pending.size() + group->cold_pending.size();
+}
+
+static bool try_pop_dispatch_request_locked(struct dispatch_group_state* group,
+                                           struct mixed_dispatch_request* request_out)
+{
+    if (group->policy == DISPATCH_MIXED_RATIO)
+    {
+        bool preferred_hot = (group->issue_count % 4) == 0;
+        std::deque<struct mixed_dispatch_request>* preferred =
+            preferred_hot ? &group->hot_pending : &group->cold_pending;
+        std::deque<struct mixed_dispatch_request>* alternate =
+            preferred_hot ? &group->cold_pending : &group->hot_pending;
+
+        if (!preferred->empty())
+        {
+            *request_out = preferred->front();
+            preferred->pop_front();
+            group->issue_count++;
+            return true;
+        }
+
+        if (!alternate->empty())
+        {
+            *request_out = alternate->front();
+            alternate->pop_front();
+            group->issue_count++;
+            return true;
+        }
+
+        return false;
+    }
+
+    if (!group->hot_pending.empty())
+    {
+        *request_out = group->hot_pending.front();
+        group->hot_pending.pop_front();
+        group->issue_count++;
+        return true;
+    }
+
+    if (!group->cold_pending.empty())
+    {
+        *request_out = group->cold_pending.front();
+        group->cold_pending.pop_front();
+        group->issue_count++;
+        return true;
+    }
+
+    return false;
+}
+
 static experiment_mode parse_mode(int argc, char** argv)
 {
     if(argc < 2)
@@ -317,7 +421,12 @@ static int read_module_io_queue_depth(unsigned int* depth_out)
     return 0;
 }
 
-static int submit_direct_read(const struct disk* disk, struct queue_pair* qp, const nvm_dma_t* buffer, const struct file_info* info, uint16_t* cid_out, struct timespec* submit_time_out)
+static int submit_direct_read(const struct disk* disk,
+                              struct queue_pair* qp,
+                              const nvm_dma_t* buffer,
+                              const struct file_info* info,
+                              uint16_t cid,
+                              struct timespec* submit_time_out)
 {
     nvm_queue_t* sq = &qp->sq->queue;
     size_t bytes = info->num_blocks * disk->block_size;
@@ -339,8 +448,6 @@ static int submit_direct_read(const struct disk* disk, struct queue_pair* qp, co
     memset(cmd, 0, sizeof(nvm_cmd_t));
 
     uint16_t cmd_slot = (uint16_t)(((uintptr_t)cmd - (uintptr_t)sq->vaddr) / sq->es); //cmd这个指针落在第几个槽位，cmd_slot = (cmd 地址 - 队列起始地址) / 每个命令槽大小
-    uint16_t cid = NVM_DEFAULT_CID(sq); //获取cid
-
     size_t sq_pages = NVM_SQ_PAGES(qp->sq->qmem.dma, sq->qs);
     size_t available_prp_pages = (qp->sq->qmem.dma->n_ioaddrs > sq_pages) ? (qp->sq->qmem.dma->n_ioaddrs - sq_pages) : 0;
     nvm_prp_list_t list = {};
@@ -370,12 +477,25 @@ static int submit_direct_read(const struct disk* disk, struct queue_pair* qp, co
         clock_gettime(CLOCK_MONOTONIC_RAW, submit_time_out);
     }
 
-    if (cid_out != NULL)
+    return 0;
+}
+
+static uint16_t reserve_dispatch_cid(std::vector<struct inflight_request>* inflight,
+                                     uint16_t* next_cid_io)
+{
+    uint16_t cid = *next_cid_io;
+
+    for (size_t attempt = 0; attempt < DispatchCidCount; ++attempt)
     {
-        *cid_out = cid;
+        if (!(*inflight)[cid].valid)
+        {
+            *next_cid_io = (uint16_t)(cid + 1);
+            return cid;
+        }
+        cid = (uint16_t)(cid + 1);
     }
 
-    return 0;
+    return UINT16_MAX;
 }
 
 static uint64_t monotonic_time_ns()
@@ -428,6 +548,166 @@ static int read_one_completion(struct queue_pair* qp, uint16_t* cid_out, uint64_
     return 0;
 }
 
+static void dispatch_thread(struct dispatch_group_state* group,
+                            const struct disk* disk)
+{
+    size_t inflight_target = group->inflight_target;
+    std::vector<struct inflight_request> inflight(DispatchCidCount);
+    struct mixed_dispatch_request pending = {};
+    size_t inflight_count = 0;
+    int status = 0;
+    uint16_t next_cid = 0;
+    size_t sq_pages = NVM_SQ_PAGES(group->qp->sq->qmem.dma, group->qp->sq->queue.qs);
+
+    if (inflight_target >= group->qp->sq->queue.qs)
+    {
+        inflight_target = group->qp->sq->queue.qs > 1 ? (group->qp->sq->queue.qs - 1) : 1;
+    }
+
+    if (group->qp->sq->qmem.dma->n_ioaddrs > sq_pages)
+    {
+        memset(NVM_DMA_OFFSET(group->qp->sq->qmem.dma, sq_pages), 0,
+               group->qp->sq->qmem.dma->page_size * (group->qp->sq->qmem.dma->n_ioaddrs - sq_pages));
+    }
+
+    while (keep_running.load() || inflight_count > 0 || pending.valid)
+    {
+        while (inflight_count < inflight_target)
+        {
+            if (!pending.valid)
+            {
+                std::unique_lock<std::mutex> lock(group->mutex);
+                if (!try_pop_dispatch_request_locked(group, &pending))
+                {
+                    group->can_push.notify_all();
+                    break;
+                }
+                group->can_push.notify_all();
+            }
+
+            uint16_t cid = 0;
+            struct timespec submit_time = {};
+            cid = reserve_dispatch_cid(&inflight, &next_cid);
+            if (cid == UINT16_MAX)
+            {
+                if (pending.stats != NULL && pending.stats->error_status == 0)
+                {
+                    pending.stats->error_status = ENOSPC;
+                }
+                fprintf(stderr, "[Dispatcher] exhausted CID space while requests are still inflight.\n");
+                return;
+            }
+
+            status = submit_direct_read(disk, group->qp, pending.buffer, pending.info, cid, &submit_time);
+
+            if (status == EAGAIN)
+            {
+                break;
+            }
+
+            if (status != 0)
+            {
+                if (pending.stats != NULL && pending.stats->error_status == 0)
+                {
+                    pending.stats->error_status = status;
+                }
+                fprintf(stderr,
+                        "[Dispatcher] submit failed for thread %zu: %s\n",
+                        pending.thread_index,
+                        nvm_strerror(status));
+                return;
+            }
+
+            if (inflight[cid].valid)
+            {
+                if (pending.stats != NULL && pending.stats->error_status == 0)
+                {
+                    pending.stats->error_status = EOVERFLOW;
+                }
+                fprintf(stderr,
+                        "[Dispatcher] invalid cid state: cid=%u slots=%zu valid=%d\n",
+                        cid,
+                        inflight.size(),
+                        (int)inflight[cid].valid);
+                return;
+            }
+
+            inflight[cid].issue_time = pending.issue_time;
+            inflight[cid].submit_time = submit_time;
+            inflight[cid].is_hot = pending.is_hot;
+            inflight[cid].valid = true;
+            inflight[cid].owner_stats = pending.stats;
+            inflight[cid].owner_latency = pending.latency;
+            inflight[cid].owner_thread_index = pending.thread_index;
+            inflight[cid].opcode = NVM_IO_READ;
+            inflight[cid].nsid = disk->ns_id;
+            inflight[cid].slba = pending.info->offset;
+            inflight[cid].nblocks = (uint16_t)pending.info->num_blocks;
+            inflight_count++;
+            pending.valid = false;
+        }
+
+        if (inflight_count == 0)
+        {
+            std::unique_lock<std::mutex> lock(group->mutex);
+            if (!keep_running.load() && pending_count_locked(group) == 0)
+            {
+                break;
+            }
+            group->can_pop.wait_for(lock, std::chrono::milliseconds(1));
+            continue;
+        }
+
+        uint16_t done_cid = 0;
+        status = read_one_completion(group->qp, &done_cid, 100);
+
+        if (status == ETIMEDOUT)
+        {
+            continue;
+        }
+
+        if (status != 0)
+        {
+            fprintf(stderr,
+                    "[Dispatcher] completion failed: %s (SQ=%u CQ=%u inflight=%zu)\n",
+                    nvm_strerror(status),
+                    group->qp->sq->queue.no,
+                    group->qp->cq->queue.no,
+                    inflight_count);
+            break;
+        }
+
+        if (!inflight[done_cid].valid)
+        {
+            fprintf(stderr,
+                    "[Dispatcher] completion cid mismatch: cid=%u slots=%zu\n",
+                    done_cid,
+                    inflight.size());
+            break;
+        }
+
+        struct timespec done_time;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &done_time);
+
+        if (inflight[done_cid].is_hot)
+        {
+            inflight[done_cid].owner_stats->hot_io_count++;
+            if (inflight[done_cid].owner_latency != NULL)
+            {
+                double elapsed_us = (double)diff_us(&inflight[done_cid].issue_time, &done_time);
+                latency_log_push(inflight[done_cid].owner_latency, elapsed_us);
+            }
+        }
+        else
+        {
+            inflight[done_cid].owner_stats->cold_io_count++;
+        }
+
+        inflight[done_cid].valid = false;
+        inflight_count--;
+    }
+}
+
 
 void work_thread(struct work_args* kthread, experiment_mode mode)
 {
@@ -439,6 +719,51 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
     struct file_info* info_cold = kthread->info_cold;
     struct latency_log* latency = kthread->latencies;
     struct thread_stats* stats = kthread->stats;
+
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    {
+        size_t route_count = 0;
+
+        while (keep_running.load())
+        {
+            struct mixed_dispatch_request request = {};
+            struct dispatch_group_state* group = &kthread->dispatch_groups[
+                kthread->dispatch_group_base + (route_count % kthread->dispatch_group_count)];
+
+            request.valid = true;
+            request.is_hot = kthread->workload == WORKLOAD_HOT;
+            request.buffer = request.is_hot ? dma_buffer : (dma_buffer_cold != NULL ? dma_buffer_cold : dma_buffer);
+            request.info = request.is_hot ? info : (info_cold != NULL ? info_cold : info);
+            request.stats = stats;
+            request.latency = request.is_hot ? latency : NULL;
+            request.thread_index = kthread->thread_index;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &request.issue_time);
+
+            std::unique_lock<std::mutex> lock(group->mutex);
+            group->can_push.wait(lock, [group]() {
+                return !keep_running.load() ||
+                       pending_count_locked(group) < MixedPendingDepthPerGroup;
+            });
+
+            if (!keep_running.load())
+            {
+                break;
+            }
+
+            if (request.is_hot)
+            {
+                group->hot_pending.push_back(request);
+            }
+            else
+            {
+                group->cold_pending.push_back(request);
+            }
+            lock.unlock();
+            group->can_pop.notify_one();
+            route_count++;
+        }
+        return;
+    }
 
     if(mode == MODE_ISOLATED)
     {
@@ -545,213 +870,6 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             count++;
         }
     }
-    else
-    {
-        size_t cid_slots = qp->sq->queue.qs * 2;
-        size_t inflight_target = MixedInflightDepth;
-        std::vector<struct inflight_request> inflight(cid_slots);
-        size_t inflight_count = 0;
-        size_t issue_count = 0;
-        int status = 0;
-        size_t sq_pages = NVM_SQ_PAGES(qp->sq->qmem.dma, qp->sq->queue.qs);//当前这个sq要占用多少个page
-
-        if(cid_slots == 0)
-        {
-            stats->error_status = EINVAL;
-            return;
-        }
-
-        if(inflight_target >= qp->sq->queue.qs)
-        {
-            inflight_target = qp->sq->queue.qs > 1 ? (qp->sq->queue.qs - 1) : 1;
-        }
-
-        if(qp->sq->qmem.dma->n_ioaddrs > sq_pages)
-        {
-            memset(NVM_DMA_OFFSET(qp->sq->qmem.dma, sq_pages), 0,
-                        qp->sq->qmem.dma->page_size * (qp->sq->qmem.dma->n_ioaddrs - sq_pages));
-            //第一个参数是起始点，跳过sq的原文，第三个参数是长度
-        }
-
-        while(keep_running.load())
-        {
-            while(keep_running.load() && inflight_count < inflight_target)
-            {
-                const nvm_dma_t* target_buffer = {};
-                const struct file_info* target_info = {};
-                bool is_hot = false;
-                if(mode == MODE_MIXED)
-                {
-                    is_hot = (issue_count % 4) == 0;
-                    target_buffer = is_hot ? dma_buffer : dma_buffer_cold;
-                    target_info = is_hot ? info : info_cold;
-                }
-                else if(mode == MODE_STRONG_ISOLATED)
-                {
-                    is_hot = kthread->workload == WORKLOAD_HOT ? 1 : 0;
-                    target_buffer = dma_buffer;
-                    target_info = info;
-                }
-                uint16_t cid = 0;
-                struct timespec submit_time = {};
-                status = submit_direct_read(disk, qp, target_buffer, target_info, &cid, &submit_time);
-
-                if(status == EAGAIN)
-                {
-                    break;
-                }
-
-                if(status != 0)
-                {
-                    stats->error_status = status;
-                    fprintf(stderr,
-                            "[Mixed Thread %zu] submit failed: %s\n",
-                            kthread->thread_index,
-                            nvm_strerror(status));
-                    return;
-                }
-                if(cid >= cid_slots || inflight[cid].valid)
-                {
-                    stats->error_status = EOVERFLOW;
-                    fprintf(stderr,
-                            "[Mixed Thread %zu] invalid cid state: cid=%u slots=%zu valid=%d\n",
-                            kthread->thread_index,
-                            cid,
-                            cid_slots,
-                            cid < cid_slots ? (int)inflight[cid].valid : -1);
-                    return;
-                }
-
-                inflight[cid].submit_time = submit_time;
-                inflight[cid].is_hot = is_hot;
-                inflight[cid].valid = true;
-                inflight[cid].opcode = NVM_IO_READ;
-                inflight[cid].nsid = disk->ns_id;
-                inflight[cid].slba = target_info->offset;
-                inflight[cid].nblocks = (uint16_t)target_info->num_blocks;
-                inflight_count++;
-                issue_count++;
-
-            }
-
-            if(inflight_count == 0)
-            {
-                usleep(1);
-                continue;
-            }
-
-            uint16_t done_cid = 0;
-            status = read_one_completion(qp, &done_cid, 100);
-            
-            if(status == ETIMEDOUT)
-            {
-                if(qp->stop || !keep_running.load())
-                {
-                    break;
-                }
-                continue;
-            }
-
-            if(status != 0)
-            {
-                stats->error_status = status;
-                fprintf(stderr,
-                        "[Mixed Thread %zu] completion failed: %s (SQ=%u CQ=%u inflight=%zu)\n",
-                        kthread->thread_index,
-                        nvm_strerror(status),
-                        qp->sq->queue.no,
-                        qp->cq->queue.no,
-                        inflight_count);
-                if (done_cid < cid_slots && inflight[done_cid].valid)
-                {
-                    fprintf(stderr,
-                            "[Mixed Thread %zu] failed cid=%u op=0x%x nsid=%u slba=%lu nblk=%u\n",
-                            kthread->thread_index,
-                            done_cid,
-                            inflight[done_cid].opcode,
-                            inflight[done_cid].nsid,
-                            inflight[done_cid].slba,
-                            inflight[done_cid].nblocks);
-                }
-                break;
-
-            }
-
-            if(done_cid >= cid_slots || !inflight[done_cid].valid)
-            {
-                stats->error_status = EIO;
-                fprintf(stderr,
-                        "[Mixed Thread %zu] completion cid mismatch: cid=%u slots=%zu\n",
-                        kthread->thread_index,
-                        done_cid,
-                        cid_slots);
-                break;
-            }
-
-            struct timespec done_time;
-            clock_gettime(CLOCK_MONOTONIC_RAW, &done_time);
-
-            if(inflight[done_cid].is_hot)
-            {
-                stats->hot_io_count++;
-                if(latency != NULL)
-                {
-                    double elapsed_us = (double)diff_us(&inflight[done_cid].submit_time, &done_time);
-                    latency_log_push(latency, elapsed_us);
-                }
-            }
-            else
-            {
-                stats->cold_io_count++;
-            }
-
-            inflight[done_cid].valid = false;
-            inflight_count--;
-        }
-
-        while(inflight_count > 0)
-        {
-            uint16_t done_cid = 0;
-            status = read_one_completion(qp, &done_cid, 10);
-            if(status == ETIMEDOUT)
-            {
-                break;
-            }
-            if(status != 0)
-            {
-                if(stats->error_status == 0)
-                {
-                    stats->error_status = status;
-                }
-                break;
-            }
-
-            if (done_cid >= cid_slots || !inflight[done_cid].valid)
-            {
-                continue;
-            }
-
-            struct timespec done_time;
-            clock_gettime(CLOCK_MONOTONIC_RAW, &done_time);
-
-            if (inflight[done_cid].is_hot)
-            {
-                stats->hot_io_count++;
-                if (latency != NULL)
-                {
-                    double elapsed_us = (double)diff_us(&inflight[done_cid].submit_time, &done_time);
-                    latency_log_push(latency, elapsed_us);
-                }
-            }
-            else
-            {
-                stats->cold_io_count++;
-            }
-
-            inflight[done_cid].valid = false;
-            inflight_count--;
-        }
-    }
 }
 
 int main(int argc, char** argv)
@@ -775,12 +893,15 @@ int main(int argc, char** argv)
     struct latency_log hot_latencies[TotalThread] = {};
     struct work_args work_threads[TotalThread] = {};
     struct thread_stats stats_for_thread[TotalThread] = {};
+    struct dispatch_group_state dispatch_groups[TotalThread] = {};
 
     std::thread workers[TotalThread];
+    std::thread dispatchers[TotalThread];
 
     double avg;
     double p95;
     double p99;
+    double elapsed_seconds = 0.0;
     size_t i;
     bool any_thread_started = false;
     std::vector<double> all_hot_latencies;
@@ -788,7 +909,8 @@ int main(int argc, char** argv)
     size_t total_cold_ios = 0;
     int hot_error_count = 0;
     int cold_error_count = 0;
-    
+    uint64_t run_start_ns = 0;
+    uint64_t run_end_ns = 0;
     // 1. 初始化控制节点与分配队列 (沿用你跑通的逻辑)
     snvme_c_fd = open(snvme_control_path, O_RDWR); 
     if (snvme_c_fd < 0)
@@ -823,6 +945,7 @@ int main(int argc, char** argv)
     }
 
     ctrl->device_addr = nvme_pci_addr;
+
     close(snvme_c_fd);
     close(snvme_d_fd);
     snvme_c_fd = -1;
@@ -1038,7 +1161,14 @@ int main(int argc, char** argv)
         }
         else
         {
-            queue_index = i;
+            if (mode == MODE_MIXED)
+            {
+                queue_index = i;
+            }
+            else
+            {
+                queue_index = i;
+            }
         }
         qps[i].cq = &ctrl->queues[queue_index];
         qps[i].sq = &ctrl->queues[queue_index + ctrl->cq_num];
@@ -1092,10 +1222,21 @@ int main(int argc, char** argv)
         work_threads[i].disk = &disk;
         work_threads[i].dma_buffer = buffers[i].dma;
         work_threads[i].info = &infos[i];
-        
+        work_threads[i].dispatch_groups = dispatch_groups;
+        work_threads[i].dispatch_group_base = 0;
+        work_threads[i].dispatch_group_count = 0;
         work_threads[i].qp = &qps[i];
         work_threads[i].stats = &stats_for_thread[i];
-        if(mode == MODE_MIXED || mode == MODE_WEAK_MIXED)
+        if(mode == MODE_MIXED)
+        {
+            work_threads[i].dma_buffer_cold = buffers_cold[i].dma;
+            work_threads[i].info_cold = &infos_cold[i];
+            work_threads[i].latencies = (i < HotThread) ? &hot_latencies[i] : NULL;
+            work_threads[i].workload = (i < HotThread) ? WORKLOAD_HOT : WORKLOAD_COLD;
+            work_threads[i].dispatch_group_base = 0;
+            work_threads[i].dispatch_group_count = MixedQueueCount;
+        }
+        else if(mode == MODE_WEAK_MIXED)
         {
             work_threads[i].dma_buffer_cold = buffers_cold[i].dma;
             work_threads[i].info_cold = &infos_cold[i];
@@ -1105,13 +1246,24 @@ int main(int argc, char** argv)
         {
             if(i < HotThread)
             {
+                work_threads[i].dma_buffer_cold = NULL;
+                work_threads[i].info_cold = NULL;
                 work_threads[i].latencies = &hot_latencies[i];
                 work_threads[i].workload = WORKLOAD_HOT;
+                work_threads[i].dispatch_group_base = 0;
+                work_threads[i].dispatch_group_count = HotThread;
             }
             else
             {
+                work_threads[i].dma_buffer_cold = NULL;
+                work_threads[i].info_cold = NULL;
                 work_threads[i].latencies = NULL;
                 work_threads[i].workload = WORKLOAD_COLD;
+                if (mode == MODE_STRONG_ISOLATED)
+                {
+                    work_threads[i].dispatch_group_base = HotThread;
+                    work_threads[i].dispatch_group_count = ColdThread;
+                }
             }
         }
         
@@ -1119,8 +1271,14 @@ int main(int argc, char** argv)
 
     if (mode == MODE_MIXED)
     {
-        printf("Mixed mode keeps hot+cold requests in-flight on each queue pair (pattern 1 hot : 3 cold, depth=%zu).\n",
-               MixedInflightDepth);
+        for (i = 0; i < MixedQueueCount; ++i)
+        {
+            dispatch_groups[i].qp = &qps[i];
+            dispatch_groups[i].policy = DISPATCH_MIXED_RATIO;
+            dispatch_groups[i].inflight_target = MixedInflightDepth;
+            dispatch_groups[i].issue_count = 0;
+        }
+        printf("Mixed mode runs 4 hot producer threads and 12 cold producer threads over 16 shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals.\n");
     }
     else if (mode == MODE_WEAK_MIXED)
     {
@@ -1128,15 +1286,48 @@ int main(int argc, char** argv)
     }
     else if (mode == MODE_STRONG_ISOLATED)
     {
-        printf("Strong-isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data, with depth=%zu per queue pair.\n",
-               MixedInflightDepth);
+        for (i = 0; i < HotThread; ++i)
+        {
+            dispatch_groups[i].qp = &qps[i];
+            dispatch_groups[i].policy = DISPATCH_FIFO;
+            dispatch_groups[i].inflight_target = StrongIsolatedHotInflightDepth;
+            dispatch_groups[i].issue_count = 0;
+        }
+        for (i = HotThread; i < TotalThread; ++i)
+        {
+            dispatch_groups[i].qp = &qps[i];
+            dispatch_groups[i].policy = DISPATCH_FIFO;
+            dispatch_groups[i].inflight_target = StrongIsolatedColdInflightDepth;
+            dispatch_groups[i].issue_count = 0;
+        }
+        printf("Strong-isolated mode keeps 4 hot producer threads and 12 cold producer threads, but dispatches them through isolated hot queues 0-3 and isolated cold queues 4-15 with hot depth=%zu and cold depth=%zu per queue pair.\n",
+               StrongIsolatedHotInflightDepth,
+               StrongIsolatedColdInflightDepth);
     }
     else
     {
         printf("Isolated mode reserves queue 0-3 for hot data and queue 4-15 for cold data.\n");
     }
+    printf("Timed run: %u s\n", TestDurationSeconds);
 
     keep_running = true;
+    run_start_ns = monotonic_time_ns();
+
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    {
+        for (i = 0; i < TotalThread; ++i)
+        {
+            try
+            {
+                dispatchers[i] = std::thread(dispatch_thread, &dispatch_groups[i], &disk);
+            }
+            catch (const std::system_error& e)
+            {
+                fprintf(stderr, "Failed to start dispatcher thread %zu: %s\n", i, e.what());
+                goto out;
+            }
+        }
+    }
 
     for(int i = 0; i < TotalThread; i++)
     {
@@ -1155,9 +1346,14 @@ int main(int argc, char** argv)
 
     sleep(TestDurationSeconds);
     keep_running = false;
-    for(i = 0; i < TotalThread; i++)
+
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
     {
-        qps[i].stop = true;
+        for (i = 0; i < TotalThread; ++i)
+        {
+            dispatch_groups[i].can_push.notify_all();
+            dispatch_groups[i].can_pop.notify_all();
+        }
     }
 
     for(int i = 0; i < TotalThread; i++)
@@ -1165,15 +1361,35 @@ int main(int argc, char** argv)
         if(workers[i].joinable())
             workers[i].join();
     }
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    {
+        for (i = 0; i < TotalThread; ++i)
+        {
+            if (dispatchers[i].joinable())
+            {
+                dispatchers[i].join();
+            }
+        }
+    }
+    run_end_ns = monotonic_time_ns();
+    for(i = 0; i < TotalThread; i++)
+    {
+        qps[i].stop = true;
+    }
 
     any_thread_started = false;
+    elapsed_seconds = (double)(run_end_ns - run_start_ns) / 1000000000.0;
+    if (elapsed_seconds <= 0.0)
+    {
+        elapsed_seconds = 1e-9;
+    }
 
     for(int i = 0; i < TotalThread; i++)
     {
         total_hot_ios += stats_for_thread[i].hot_io_count;
         total_cold_ios += stats_for_thread[i].cold_io_count;
 
-        if(mode == MODE_ISOLATED)
+        if(mode == MODE_ISOLATED || mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
         {
             if(i < HotThread)
             {
@@ -1228,14 +1444,15 @@ int main(int argc, char** argv)
         }
         // printf("Mode: %s\n", mode_name(mode));
         printf("Hot Threads: %zu, Cold Threads: %zu\n", HotThread, ColdThread);
+        printf("Elapsed Time: %.3f s\n", elapsed_seconds);
         printf("Total Hot Requests: %zu\n", all_hot_latencies.size());
         printf("Average Latency: %.2f us\n", avg);
         printf("P95 Tail Latency: %.2f us\n", p95);
         printf("P99 Tail Latency: %.2f us\n", p99);
         printf("Hot Throughput: %.2f MB/s\n",
-               (double)(total_hot_ios * hot_piece_size) / (1024.0 * 1024.0 * TestDurationSeconds));
+               (double)(total_hot_ios * hot_piece_size) / (1024.0 * 1024.0 * elapsed_seconds));
         printf("Cold Throughput: %.2f MB/s\n",
-               (double)(total_cold_ios * cold_piece_size) / (1024.0 * 1024.0 * TestDurationSeconds));
+               (double)(total_cold_ios * cold_piece_size) / (1024.0 * 1024.0 * elapsed_seconds));
         printf("Hot Thread Errors: %d\n", hot_error_count);
         printf("Cold Thread Errors: %d\n", cold_error_count);
     }
@@ -1267,6 +1484,14 @@ int main(int argc, char** argv)
     return 0;
 out:
     keep_running = false;
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    {
+        for (i = 0; i < TotalThread; ++i)
+        {
+            dispatch_groups[i].can_push.notify_all();
+            dispatch_groups[i].can_pop.notify_all();
+        }
+    }
     for (i = 0; i < TotalThread; ++i)
     {
         qps[i].stop = true;
@@ -1278,6 +1503,16 @@ out:
             if (workers[i].joinable())
             {
                 workers[i].join();
+            }
+        }
+    }
+    if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED)
+    {
+        for (i = 0; i < TotalThread; ++i)
+        {
+            if (dispatchers[i].joinable())
+            {
+                dispatchers[i].join();
             }
         }
     }

@@ -198,7 +198,8 @@ int main(int argc, char** argv)
     printf("disk block size is %u, max data size is %u\n",disk.block_size,disk.max_data_size);
     //将文件系统挂载到指定路径，并创建一个测试文件，准备进行读写操作
     status = Host_file_system_int(nvme_dev_path, nvme_mount_path);
-    if (status != 0) {
+    if (status != 0)
+    {
         goto out;
     }
     //创建测试文件，并写入数据
