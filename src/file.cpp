@@ -1,6 +1,8 @@
 #include <iostream>  
 #include <cstdlib>  
 #include <cstring>  
+#include <cerrno>
+#include <sys/stat.h>
 #include <unistd.h>
 
 void executeCommand(const char *command) {  
@@ -28,6 +30,27 @@ void syncFileSystem(const char *device) {
     snprintf(command, sizeof(command), "sync %s", device);  
     executeCommand(command);  
 }  
+
+bool ensureMountPoint(const char *mountPoint) {
+    struct stat st;
+    if (stat(mountPoint, &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+
+    if (errno != ENOENT) {
+        std::cerr << "Failed to stat mount point " << mountPoint
+                  << ": " << std::strerror(errno) << std::endl;
+        return false;
+    }
+
+    if (mkdir(mountPoint, 0755) != 0 && errno != EEXIST) {
+        std::cerr << "Failed to create mount point " << mountPoint
+                  << ": " << std::strerror(errno) << std::endl;
+        return false;
+    }
+
+    return true;
+}
 
 bool mountDevice(const char *device, const char *mountPoint) {  
     char command[256];  
@@ -57,6 +80,10 @@ bool lumountDevice(const char *device) {
 
 int Host_file_system_int(const char *device, const char *mountPoint)
 {
+    if (!ensureMountPoint(mountPoint)) {
+        return EXIT_FAILURE;
+    }
+
     if (!checkFileSystem(device)) {  
         std::cerr << "Filesystem not detected. Creating ext4 filesystem..." << std::endl;  
         createFileSystem(device);  

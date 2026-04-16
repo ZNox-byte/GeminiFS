@@ -33,6 +33,6 @@ all:
 clean:
 	rm -fr *.o *.ko *.mod* .*.cmd .*.d Module.symvers modules.order
 install:
-	sudo insmod snvme-core.ko && sudo insmod snvme.ko
+	sudo insmod snvme-core.ko multipath=0 && sudo insmod snvme.ko
 rm:
 	sudo rmmod snvme && sudo rmmod snvme_core

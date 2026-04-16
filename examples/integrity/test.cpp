@@ -31,7 +31,7 @@
 #define snvme_helper_path "/dev/snvme_helper"
 #define nvme_mount_path "/mnt/nvm_mount"
 #define file_name "/mnt/nvm_mount/test.data"
-#define nvme_pci_addr {0xc3, 0, 0}
+#define nvme_pci_addr {0xc1, 0, 0}
 
 std::atomic<bool> keep_running(true);
 

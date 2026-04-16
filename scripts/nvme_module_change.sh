@@ -30,7 +30,7 @@ load_custom_modules() {
 }  
 load_modified_modules() {  
     local path=$1  
-    insmod $path/snvme-core.ko  
+    insmod $path/snvme-core.ko multipath=0  
     insmod $path/snvme.ko  
 }  
 

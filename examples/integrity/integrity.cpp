@@ -92,7 +92,7 @@ static int request_queues(nvm_ctrl_t* ctrl, struct queue** queues)
 #define snvme_helper_path "/dev/snvme_helper"
 #define nvme_mount_path "/mnt/nvm_mount"
 #define file_name "/mnt/nvm_mount/test.data"
-#define nvme_pci_addr {0xc3, 0, 0}
+#define nvme_pci_addr {0xc1, 0, 0}
 
 int main(int argc, char** argv)
 {
@@ -197,7 +197,10 @@ int main(int argc, char** argv)
     }
     printf("disk block size is %u, max data size is %u\n",disk.block_size,disk.max_data_size);
     //将文件系统挂载到指定路径，并创建一个测试文件，准备进行读写操作
-    Host_file_system_int(nvme_dev_path,nvme_mount_path);
+    status = Host_file_system_int(nvme_dev_path, nvme_mount_path);
+    if (status != 0) {
+        goto out;
+    }
     //创建测试文件，并写入数据
     fd = open(file_name, O_RDWR| O_CREAT | O_DIRECT , S_IRUSR | S_IWUSR);
     if (fd < 0) {
@@ -258,7 +261,7 @@ int main(int argc, char** argv)
     qp.stop = true;
     close(fd);
 out:
-    ret = Host_file_system_exit(nvme_dev_path);
+    ret = Host_file_system_exit(nvme_mount_path);
     
     if(ret < 0)
         exit(-1);
