@@ -13,7 +13,14 @@ QUEUE_DEPTHS=()
 MIXED_INFLIGHT="${MIXED_INFLIGHT:-32}"
 STRONG_HOT_INFLIGHT="${STRONG_HOT_INFLIGHT:-16}"
 STRONG_COLD_INFLIGHT="${STRONG_COLD_INFLIGHT:-8}"
+HOT_BUDGET="${HOT_BUDGET:-}"
+COLD_BUDGET="${COLD_BUDGET:-}"
+STRONG_HOT_RATIO=""
+STRONG_COLD_RATIO=""
 RESET_MODULES=1
+EXPLICIT_MIXED_INFLIGHT=0
+EXPLICIT_STRONG_HOT_INFLIGHT=0
+EXPLICIT_STRONG_COLD_INFLIGHT=0
 
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_DIR_DEFAULT="${ROOT_DIR}/results/queue-depth-matrix/${TIMESTAMP}"
@@ -23,16 +30,23 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/run_queue_depth_matrix.sh [options] [queue_depth...]
+  scripts/run_queue_depth_matrix.sh <queue_depth> <mixed_inflight> <strong_hot_ratio> <strong_cold_ratio>
 
 Examples:
   scripts/run_queue_depth_matrix.sh
   scripts/run_queue_depth_matrix.sh 64 128
   scripts/run_queue_depth_matrix.sh --mixed-inflight 16 --strong-hot-inflight 16 --strong-cold-inflight 8 64 128
+  scripts/run_queue_depth_matrix.sh --hot-budget 10000 --cold-budget 60000 32
+  scripts/run_queue_depth_matrix.sh 33 32 0.5 0.25
 
 Options:
   --mixed-inflight N         Inflight per queue pair for mixed/hot-only. Default: 32
   --strong-hot-inflight N    Inflight per hot queue pair for strong-i. Default: 16
   --strong-cold-inflight N   Inflight per cold queue pair for strong-i. Default: 8
+  --hot-budget N             Stop after generating N hot requests
+  --cold-budget N            Stop after generating N cold requests
+  --strong-hot-ratio R       strong-i hot inflight = round(mixed_inflight * R)
+  --strong-cold-ratio R      strong-i cold inflight = round(mixed_inflight * R)
   --output-dir DIR           Directory for logs and summary output
   --no-reset                 Do not reload snvme modules before each benchmark case
   -h, --help                 Show this help message
@@ -41,21 +55,90 @@ Notes:
   1. This script assumes build/bin/nvm-test-bench and module/*.ko are already built.
   2. It runs three modes for each queue depth: hot-only, mixed, strong-i.
   3. The script uses sudo when reloading modules and running the benchmark.
+  4. Compact 4-argument mode means:
+       queue_depth, mixed_inflight, strong_hot_ratio, strong_cold_ratio
+     For example, "33 32 0.5 0.25" becomes strong-hot=16 and strong-cold=8.
 EOF
+}
+
+parse_positive_int() {
+    local value="$1"
+    [[ "${value}" =~ ^[0-9]+$ ]] && [[ "${value}" -gt 0 ]]
+}
+
+parse_ratio_value() {
+    local value="$1"
+    awk -v value="${value}" '
+        function fail() {
+            exit 1
+        }
+        BEGIN {
+            if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+                ratio = value + 0
+            } else if (value ~ /^[0-9]+\/[0-9]+$/) {
+                split(value, parts, "/")
+                if (parts[2] == 0) {
+                    fail()
+                }
+                ratio = parts[1] / parts[2]
+            } else {
+                fail()
+            }
+
+            if (ratio <= 0) {
+                fail()
+            }
+
+            printf "%.12f\n", ratio
+        }
+    '
+}
+
+scale_inflight_from_ratio() {
+    local base="$1"
+    local ratio="$2"
+    awk -v base="${base}" -v ratio="${ratio}" '
+        BEGIN {
+            value = int(base * ratio + 0.5)
+            if (value < 1) {
+                value = 1
+            }
+            printf "%d\n", value
+        }
+    '
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mixed-inflight)
             MIXED_INFLIGHT="$2"
+            EXPLICIT_MIXED_INFLIGHT=1
             shift 2
             ;;
         --strong-hot-inflight)
             STRONG_HOT_INFLIGHT="$2"
+            EXPLICIT_STRONG_HOT_INFLIGHT=1
             shift 2
             ;;
         --strong-cold-inflight)
             STRONG_COLD_INFLIGHT="$2"
+            EXPLICIT_STRONG_COLD_INFLIGHT=1
+            shift 2
+            ;;
+        --hot-budget)
+            HOT_BUDGET="$2"
+            shift 2
+            ;;
+        --cold-budget)
+            COLD_BUDGET="$2"
+            shift 2
+            ;;
+        --strong-hot-ratio)
+            STRONG_HOT_RATIO="$2"
+            shift 2
+            ;;
+        --strong-cold-ratio)
+            STRONG_COLD_RATIO="$2"
             shift 2
             ;;
         --output-dir)
@@ -77,8 +160,84 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ ${#QUEUE_DEPTHS[@]} -eq 4 ]] \
+    && [[ "${EXPLICIT_MIXED_INFLIGHT}" -eq 0 ]] \
+    && [[ "${EXPLICIT_STRONG_HOT_INFLIGHT}" -eq 0 ]] \
+    && [[ "${EXPLICIT_STRONG_COLD_INFLIGHT}" -eq 0 ]] \
+    && [[ -z "${STRONG_HOT_RATIO}" ]] \
+    && [[ -z "${STRONG_COLD_RATIO}" ]]; then
+    mixed_arg="${QUEUE_DEPTHS[1]}"
+    hot_ratio_arg="${QUEUE_DEPTHS[2]}"
+    cold_ratio_arg="${QUEUE_DEPTHS[3]}"
+
+    if ! parse_positive_int "${mixed_arg}"; then
+        echo "Invalid compact-mode mixed_inflight: ${mixed_arg}" >&2
+        exit 1
+    fi
+
+    STRONG_HOT_RATIO="$(parse_ratio_value "${hot_ratio_arg}")" || {
+        echo "Invalid compact-mode strong_hot_ratio: ${hot_ratio_arg}" >&2
+        exit 1
+    }
+    STRONG_COLD_RATIO="$(parse_ratio_value "${cold_ratio_arg}")" || {
+        echo "Invalid compact-mode strong_cold_ratio: ${cold_ratio_arg}" >&2
+        exit 1
+    }
+
+    MIXED_INFLIGHT="${mixed_arg}"
+    EXPLICIT_MIXED_INFLIGHT=1
+    QUEUE_DEPTHS=("${QUEUE_DEPTHS[0]}")
+fi
+
 if [[ ${#QUEUE_DEPTHS[@]} -eq 0 ]]; then
     QUEUE_DEPTHS=("${DEFAULT_QUEUE_DEPTHS[@]}")
+fi
+
+if ! parse_positive_int "${MIXED_INFLIGHT}"; then
+    echo "Invalid mixed inflight: ${MIXED_INFLIGHT}" >&2
+    exit 1
+fi
+
+if [[ -n "${HOT_BUDGET}" ]] && ! parse_positive_int "${HOT_BUDGET}"; then
+    echo "Invalid hot budget: ${HOT_BUDGET}" >&2
+    exit 1
+fi
+
+if [[ -n "${COLD_BUDGET}" ]] && ! parse_positive_int "${COLD_BUDGET}"; then
+    echo "Invalid cold budget: ${COLD_BUDGET}" >&2
+    exit 1
+fi
+
+if [[ -n "${STRONG_HOT_RATIO}" ]]; then
+    STRONG_HOT_RATIO="$(parse_ratio_value "${STRONG_HOT_RATIO}")" || {
+        echo "Invalid strong hot ratio." >&2
+        exit 1
+    }
+fi
+
+if [[ -n "${STRONG_COLD_RATIO}" ]]; then
+    STRONG_COLD_RATIO="$(parse_ratio_value "${STRONG_COLD_RATIO}")" || {
+        echo "Invalid strong cold ratio." >&2
+        exit 1
+    }
+fi
+
+if [[ -n "${STRONG_HOT_RATIO}" ]]; then
+    STRONG_HOT_INFLIGHT="$(scale_inflight_from_ratio "${MIXED_INFLIGHT}" "${STRONG_HOT_RATIO}")"
+fi
+
+if [[ -n "${STRONG_COLD_RATIO}" ]]; then
+    STRONG_COLD_INFLIGHT="$(scale_inflight_from_ratio "${MIXED_INFLIGHT}" "${STRONG_COLD_RATIO}")"
+fi
+
+if ! parse_positive_int "${STRONG_HOT_INFLIGHT}"; then
+    echo "Invalid strong hot inflight: ${STRONG_HOT_INFLIGHT}" >&2
+    exit 1
+fi
+
+if ! parse_positive_int "${STRONG_COLD_INFLIGHT}"; then
+    echo "Invalid strong cold inflight: ${STRONG_COLD_INFLIGHT}" >&2
+    exit 1
 fi
 
 if [[ -z "${OUTPUT_DIR}" ]]; then
@@ -140,6 +299,14 @@ run_case() {
             exit 1
             ;;
     esac
+
+    if [[ -n "${HOT_BUDGET}" ]]; then
+        cmd+=(--hot-budget "${HOT_BUDGET}")
+    fi
+
+    if [[ -n "${COLD_BUDGET}" ]]; then
+        cmd+=(--cold-budget "${COLD_BUDGET}")
+    fi
 
     echo
     echo "==== Running ${mode} @ qd=${queue_depth} ===="
