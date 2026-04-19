@@ -1,0 +1,21 @@
+mmap is 0x7f46cc188000
+dstrd  is 0, ctrl->timeout is 30000, max qs is  1024
+request_queues success
+idx start is 129, dbstrd is 0, nr user q is 16
+Hot-only mode runs 16 hot producer threads over 16 shared queue pairs with the same dispatcher structure as mixed, but generates only hot requests. Mixed inflight=32 per queue pair.
+Budget run: hot=10000, cold=60000
+Queue depth: 33
+Hot threads: 16 | Cold threads: 0 | Active producers: 16
+Mixed inflight: 32 | Strong hot inflight: 16 | Strong cold inflight: 8
+
+--- Hot Data Latency Report ---
+Hot Threads: 16, Cold Threads: 0
+Elapsed Time: 0.153 s
+Total Hot Requests: 9987
+Average Latency: 34915.41 us
+P95 Tail Latency: 67353.00 us
+P99 Tail Latency: 80405.00 us
+Hot Throughput: 254.67 MB/s
+Cold Throughput: 0.00 MB/s
+Hot Thread Errors: 0
+Cold Thread Errors: 0

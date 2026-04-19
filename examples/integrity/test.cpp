@@ -188,8 +188,8 @@ static struct run_config g_run_config = {false,
                                          DefaultColdThreadCount,
                                          false,
                                          false};
-static std::atomic<size_t> g_hot_generated(0);
-static std::atomic<size_t> g_cold_generated(0);
+static std::atomic<size_t> g_hot_issued(0);
+static std::atomic<size_t> g_cold_issued(0);
 
 struct latency_log
 {
@@ -339,6 +339,12 @@ static double percentile_value(const std::vector<double>& log, double percentile
 static size_t pending_count_locked(const struct dispatch_group_state* group)
 {
     return group->hot_pending.size() + group->cold_pending.size();
+}
+
+static size_t pending_count_snapshot(struct dispatch_group_state* group)
+{
+    std::lock_guard<std::mutex> lock(group->mutex);
+    return pending_count_locked(group);
 }
 
 static bool try_pop_dispatch_request_locked(struct dispatch_group_state* group,
@@ -589,14 +595,14 @@ static size_t mixed_pending_depth_limit()
     return g_run_config.mixed_inflight_depth * MixedPendingDepthMultiplier;
 }
 
-static bool reserve_budget_slot(workload_type workload)
+static bool claim_budget_slot(workload_type workload)
 {
     if (!g_run_config.use_budget)
     {
         return true;
     }
 
-    std::atomic<size_t>* counter = workload == WORKLOAD_HOT ? &g_hot_generated : &g_cold_generated;
+    std::atomic<size_t>* counter = workload == WORKLOAD_HOT ? &g_hot_issued : &g_cold_issued;
     size_t limit = workload == WORKLOAD_HOT ? g_run_config.hot_budget : g_run_config.cold_budget;
     size_t current = counter->load(std::memory_order_relaxed);
 
@@ -621,8 +627,8 @@ static bool budgets_exhausted(experiment_mode mode)
         return false;
     }
 
-    bool hot_done = g_hot_generated.load(std::memory_order_relaxed) >= g_run_config.hot_budget;
-    bool cold_done = g_cold_generated.load(std::memory_order_relaxed) >= g_run_config.cold_budget;
+    bool hot_done = g_hot_issued.load(std::memory_order_relaxed) >= g_run_config.hot_budget;
+    bool cold_done = g_cold_issued.load(std::memory_order_relaxed) >= g_run_config.cold_budget;
 
     if (mode == MODE_HOT_ONLY)
     {
@@ -849,7 +855,7 @@ static void dispatch_thread(struct dispatch_group_state* group,
                group->qp->sq->qmem.dma->page_size * (group->qp->sq->qmem.dma->n_ioaddrs - sq_pages));
     }
 
-    while (keep_running.load() || inflight_count > 0 || pending.valid)
+    while (keep_running.load() || inflight_count > 0 || pending.valid || pending_count_snapshot(group) > 0)
     {
         while (inflight_count < inflight_target)
         {
@@ -1025,11 +1031,6 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
                 ? WORKLOAD_HOT
                 : kthread->workload;
 
-            if (!reserve_budget_slot(target_workload))
-            {
-                break;
-            }
-
             request.valid = true;
             request.is_hot = (target_workload == WORKLOAD_HOT);
             request.buffer = request.is_hot ? dma_buffer : (dma_buffer_cold != NULL ? dma_buffer_cold : dma_buffer);
@@ -1046,6 +1047,11 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             });
 
             if (!keep_running.load())
+            {
+                break;
+            }
+
+            if (!claim_budget_slot(target_workload))
             {
                 break;
             }
@@ -1074,7 +1080,7 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             double elapsed_us;
             int status;
 
-            if (!reserve_budget_slot(kthread->workload))
+            if (!claim_budget_slot(kthread->workload))
             {
                 break;
             }
@@ -1128,7 +1134,7 @@ void work_thread(struct work_args* kthread, experiment_mode mode)
             bool is_hot;
 
             is_hot = count % 4 == 0;
-            if (!reserve_budget_slot(is_hot ? WORKLOAD_HOT : WORKLOAD_COLD))
+            if (!claim_budget_slot(is_hot ? WORKLOAD_HOT : WORKLOAD_COLD))
             {
                 break;
             }
@@ -1238,8 +1244,8 @@ int main(int argc, char** argv)
     use_legacy_isolated_layout = (hot_thread_count == DefaultHotThreadCount
                                && cold_thread_count == DefaultColdThreadCount
                                && active_thread_count == MaxThreadCount);
-    g_hot_generated.store(0, std::memory_order_relaxed);
-    g_cold_generated.store(0, std::memory_order_relaxed);
+    g_hot_issued.store(0, std::memory_order_relaxed);
+    g_cold_issued.store(0, std::memory_order_relaxed);
     // 1. 初始化控制节点与分配队列 (沿用你跑通的逻辑)
     snvme_c_fd = open(snvme_control_path, O_RDWR); 
     if (snvme_c_fd < 0)

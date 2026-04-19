@@ -1,0 +1,16 @@
+run	mode	queue_depth	mixed_inflight	strong_hot_inflight	strong_cold_inflight	elapsed_time	total_hot_requests	avg_latency	p95_latency	p99_latency	hot_throughput	cold_throughput	hot_thread_errors	cold_thread_errors
+1	hot-only	33	32	32	24	0.166 s	9997	34918.63 us	73155.00 us	113249.00 us	235.57 MB/s	0.00 MB/s	0	0
+1	mixed	33	32	32	24	2.918 s	10000	170165.47 us	248470.00 us	257225.00 us	13.39 MB/s	2569.98 MB/s	0	0
+1	strong-i	33	32	32	24	2.969 s	10000	19264.24 us	32903.00 us	33517.00 us	13.15 MB/s	2525.21 MB/s	0	0
+2	hot-only	33	32	32	24	0.141 s	9985	36881.59 us	65868.00 us	76892.00 us	276.80 MB/s	0.00 MB/s	0	0
+2	mixed	33	32	32	24	3.334 s	10000	249773.01 us	309833.00 us	326588.00 us	11.72 MB/s	2249.10 MB/s	0	0
+2	strong-i	33	32	32	24	2.907 s	10000	17888.48 us	27893.00 us	31283.00 us	13.44 MB/s	2579.52 MB/s	0	0
+3	hot-only	33	32	32	24	0.153 s	9988	31026.89 us	68800.00 us	84322.00 us	255.49 MB/s	0.00 MB/s	0	0
+3	mixed	33	32	32	24	3.053 s	10000	178099.89 us	249720.00 us	257563.00 us	12.80 MB/s	2456.28 MB/s	0	0
+3	strong-i	33	32	32	24	3.168 s	10000	14104.79 us	25831.00 us	30755.00 us	12.33 MB/s	2367.19 MB/s	0	0
+4	hot-only	33	32	32	24	0.154 s	9986	31111.82 us	65215.00 us	80319.00 us	253.46 MB/s	0.00 MB/s	0	0
+4	mixed	33	32	32	24	2.554 s	10000	121018.47 us	149551.00 us	156815.00 us	15.30 MB/s	2936.44 MB/s	0	0
+4	strong-i	33	32	32	24	2.203 s	10000	13853.90 us	27886.00 us	29783.00 us	17.73 MB/s	3403.54 MB/s	0	0
+5	hot-only	33	32	32	24	0.163 s	9991	31781.89 us	68499.00 us	95040.00 us	239.47 MB/s	0.00 MB/s	0	0
+5	mixed	33	32	32	24	2.778 s	10000	244896.96 us	305088.00 us	319518.00 us	14.06 MB/s	2699.34 MB/s	0	0
+5	strong-i	33	32	32	24	2.897 s	10000	13349.37 us	25148.00 us	27243.00 us	13.49 MB/s	2588.62 MB/s	0	0

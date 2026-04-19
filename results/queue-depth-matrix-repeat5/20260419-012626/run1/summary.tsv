@@ -1,0 +1,4 @@
+mode	queue_depth	mixed_inflight	strong_hot_inflight	strong_cold_inflight	elapsed_time	total_hot_requests	avg_latency	p95_latency	p99_latency	hot_throughput	cold_throughput	hot_thread_errors	cold_thread_errors
+hot-only	33	32	32	24	0.166 s	9997	34918.63 us	73155.00 us	113249.00 us	235.57 MB/s	0.00 MB/s	0	0
+mixed	33	32	32	24	2.918 s	10000	170165.47 us	248470.00 us	257225.00 us	13.39 MB/s	2569.98 MB/s	0	0
+strong-i	33	32	32	24	2.969 s	10000	19264.24 us	32903.00 us	33517.00 us	13.15 MB/s	2525.21 MB/s	0	0
