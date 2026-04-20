@@ -287,38 +287,39 @@ def build_mean_rows(mean_points: list[MeanPoint]) -> tuple[list[str], list[list[
 
     rows = []
     for point in mean_points:
-        rows.append(
-            [
-                point.source,
-                str(point.queue_depth),
-                str(point.mixed_inflight),
-                str(point.strong_hot_inflight),
-                str(point.strong_cold_inflight),
-                f"{point.strong_cold_ratio:.2f}",
-                point.mode,
-                str(point.runs),
-                f"{point.elapsed_time_mean_s:.3f}",
-                f"{point.total_hot_requests_mean:.2f}",
-                f"{point.avg_latency_mean_us:.2f}",
-                f"{point.avg_latency_std_us:.2f}",
-                f"{point.p95_mean_us:.2f}",
-                f"{point.p95_std_us:.2f}",
-                f"{point.p99_mean_us:.2f}",
-                f"{point.p99_std_us:.2f}",
-                f"{point.hot_throughput_mean_mb_s:.2f}",
-                f"{point.hot_throughput_std_mb_s:.2f}",
-                f"{point.cold_throughput_mean_mb_s:.2f}",
-                f"{point.cold_throughput_std_mb_s:.2f}",
-                str(point.hot_thread_errors_sum),
-                str(point.cold_thread_errors_sum),
-            ]
-        )
+        rows.append(build_mean_row(point))
 
     return headers, rows
 
 
-def write_aligned_text(mean_points: list[MeanPoint], output_path: Path) -> None:
-    headers, rows = build_mean_rows(mean_points)
+def build_mean_row(point: MeanPoint) -> list[str]:
+    return [
+        point.source,
+        str(point.queue_depth),
+        str(point.mixed_inflight),
+        str(point.strong_hot_inflight),
+        str(point.strong_cold_inflight),
+        f"{point.strong_cold_ratio:.2f}",
+        point.mode,
+        str(point.runs),
+        f"{point.elapsed_time_mean_s:.3f}",
+        f"{point.total_hot_requests_mean:.2f}",
+        f"{point.avg_latency_mean_us:.2f}",
+        f"{point.avg_latency_std_us:.2f}",
+        f"{point.p95_mean_us:.2f}",
+        f"{point.p95_std_us:.2f}",
+        f"{point.p99_mean_us:.2f}",
+        f"{point.p99_std_us:.2f}",
+        f"{point.hot_throughput_mean_mb_s:.2f}",
+        f"{point.hot_throughput_std_mb_s:.2f}",
+        f"{point.cold_throughput_mean_mb_s:.2f}",
+        f"{point.cold_throughput_std_mb_s:.2f}",
+        str(point.hot_thread_errors_sum),
+        str(point.cold_thread_errors_sum),
+    ]
+
+
+def format_aligned_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     widths = [len(header) for header in headers]
 
     for row in rows:
@@ -328,9 +329,68 @@ def write_aligned_text(mean_points: list[MeanPoint], output_path: Path) -> None:
     def format_row(row: list[str]) -> str:
         return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [format_row(headers), format_row(["-" * width for width in widths])]
     lines.extend(format_row(row) for row in rows)
+    return lines
+
+
+def write_aligned_text(mean_points: list[MeanPoint], output_path: Path) -> None:
+    headers, rows = build_mean_rows(mean_points)
+    lines = format_aligned_table(headers, rows)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_mode_grouped_text(mean_points: list[MeanPoint], output_path: Path) -> None:
+    headers, _ = build_mean_rows(mean_points)
+    mode_order = ["hot-only", "mixed", "strong-i"]
+    lines: list[str] = []
+
+    for index, mode in enumerate(mode_order):
+        grouped_points = sorted(
+            [point for point in mean_points if point.mode == mode],
+            key=lambda point: (point.queue_depth, point.strong_cold_ratio, point.source),
+        )
+        if not grouped_points:
+            continue
+
+        if index > 0 and lines:
+            lines.append("")
+
+        lines.append(f"=== {mode} ===")
+        lines.extend(format_aligned_table(headers, [build_mean_row(point) for point in grouped_points]))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def is_strong_i_hot_budget_10000(point: MeanPoint) -> bool:
+    return point.mode == "strong-i" and abs(point.total_hot_requests_mean - 10000.0) <= 1000.0
+
+
+def is_strong_i_timed_5s(point: MeanPoint) -> bool:
+    return point.mode == "strong-i" and abs(point.elapsed_time_mean_s - 5.0) <= 0.6
+
+
+def write_filtered_text(
+    mean_points: list[MeanPoint],
+    output_path: Path,
+    title: str,
+    predicate,
+) -> None:
+    headers, _ = build_mean_rows(mean_points)
+    filtered_points = sorted(
+        [point for point in mean_points if predicate(point)],
+        key=lambda point: (point.queue_depth, point.strong_cold_ratio, point.source),
+    )
+
+    lines = [title, ""]
+    if filtered_points:
+        lines.extend(format_aligned_table(headers, [build_mean_row(point) for point in filtered_points]))
+    else:
+        lines.append("No rows matched.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -562,14 +622,33 @@ def main() -> int:
 
     means_tsv = args.output_dir / "queue_depth_means.tsv"
     means_txt = args.output_dir / "queue_depth_means_aligned.txt"
+    means_by_mode_txt = args.output_dir / "queue_depth_means_by_mode.txt"
+    strong_i_budget_txt = args.output_dir / "queue_depth_means_strong_i_hot_budget_10000.txt"
+    strong_i_timed_txt = args.output_dir / "queue_depth_means_strong_i_timed_5s.txt"
     svg_path = args.output_dir / "queue_depth_metrics.svg"
 
     write_means_tsv(mean_points, means_tsv)
     write_aligned_text(mean_points, means_txt)
+    write_mode_grouped_text(mean_points, means_by_mode_txt)
+    write_filtered_text(
+        mean_points,
+        strong_i_budget_txt,
+        "=== strong-i / hot budget ~= 10000 ===",
+        is_strong_i_hot_budget_10000,
+    )
+    write_filtered_text(
+        mean_points,
+        strong_i_timed_txt,
+        "=== strong-i / timed run ~= 5s ===",
+        is_strong_i_timed_5s,
+    )
     render_svg(mean_points, svg_path)
 
     print(f"Wrote mean table: {means_tsv}")
     print(f"Wrote aligned mean table: {means_txt}")
+    print(f"Wrote mode-grouped mean table: {means_by_mode_txt}")
+    print(f"Wrote strong-i hot-budget table: {strong_i_budget_txt}")
+    print(f"Wrote strong-i timed-5s table: {strong_i_timed_txt}")
     print(f"Wrote SVG plot: {svg_path}")
     return 0
 

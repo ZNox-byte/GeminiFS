@@ -9,6 +9,8 @@ MODULE_DIR="${ROOT_DIR}/module"
 
 DEFAULT_QUEUE_DEPTHS=(64 128)
 QUEUE_DEPTHS=()
+DEFAULT_MODES=(hot-only mixed strong-i)
+MODES=("${DEFAULT_MODES[@]}")
 
 MIXED_INFLIGHT="${MIXED_INFLIGHT:-32}"
 STRONG_HOT_INFLIGHT="${STRONG_HOT_INFLIGHT:-16}"
@@ -18,6 +20,7 @@ COLD_BUDGET="${COLD_BUDGET:-}"
 STRONG_HOT_RATIO=""
 STRONG_COLD_RATIO=""
 RESET_MODULES=1
+STRONG_I_1TO1=0
 EXPLICIT_MIXED_INFLIGHT=0
 EXPLICIT_STRONG_HOT_INFLIGHT=0
 EXPLICIT_STRONG_COLD_INFLIGHT=0
@@ -38,22 +41,25 @@ Examples:
   scripts/run_queue_depth_matrix.sh --mixed-inflight 16 --strong-hot-inflight 16 --strong-cold-inflight 8 64 128
   scripts/run_queue_depth_matrix.sh --hot-budget 10000 --cold-budget 60000 32
   scripts/run_queue_depth_matrix.sh 33 32 0.5 0.25
+  scripts/run_queue_depth_matrix.sh --modes strong-i --strong-i-1to1 16 32 64 128
 
 Options:
   --mixed-inflight N         Inflight per queue pair for mixed/hot-only. Default: 32
   --strong-hot-inflight N    Inflight per hot queue pair for strong-i. Default: 16
   --strong-cold-inflight N   Inflight per cold queue pair for strong-i. Default: 8
+  --modes LIST               Comma-separated modes to run. Supported: hot-only,mixed,strong-i
   --hot-budget N             Stop after generating N hot requests
   --cold-budget N            Stop after generating N cold requests
   --strong-hot-ratio R       strong-i hot inflight = round(mixed_inflight * R)
   --strong-cold-ratio R      strong-i cold inflight = round(mixed_inflight * R)
+  --strong-i-1to1            For each queue depth, set mixed/strong-hot/strong-cold inflight equal to queue_depth
   --output-dir DIR           Directory for logs and summary output
   --no-reset                 Do not reload snvme modules before each benchmark case
   -h, --help                 Show this help message
 
 Notes:
   1. This script assumes build/bin/nvm-test-bench and module/*.ko are already built.
-  2. It runs three modes for each queue depth: hot-only, mixed, strong-i.
+  2. By default it runs three modes for each queue depth: hot-only, mixed, strong-i.
   3. The script uses sudo when reloading modules and running the benchmark.
   4. Compact 4-argument mode means:
        queue_depth, mixed_inflight, strong_hot_ratio, strong_cold_ratio
@@ -108,6 +114,41 @@ scale_inflight_from_ratio() {
     '
 }
 
+validate_mode() {
+    local mode="$1"
+
+    case "${mode}" in
+        hot-only|mixed|strong-i)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+parse_mode_list() {
+    local value="$1"
+    local -a parsed_modes=()
+    local item
+
+    IFS=',' read -r -a parsed_modes <<< "${value}"
+
+    if [[ ${#parsed_modes[@]} -eq 0 ]]; then
+        echo "Mode list must not be empty." >&2
+        exit 1
+    fi
+
+    MODES=()
+    for item in "${parsed_modes[@]}"; do
+        if ! validate_mode "${item}"; then
+            echo "Unsupported mode in --modes: ${item}" >&2
+            exit 1
+        fi
+        MODES+=("${item}")
+    done
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mixed-inflight)
@@ -125,6 +166,10 @@ while [[ $# -gt 0 ]]; do
             EXPLICIT_STRONG_COLD_INFLIGHT=1
             shift 2
             ;;
+        --modes)
+            parse_mode_list "$2"
+            shift 2
+            ;;
         --hot-budget)
             HOT_BUDGET="$2"
             shift 2
@@ -140,6 +185,10 @@ while [[ $# -gt 0 ]]; do
         --strong-cold-ratio)
             STRONG_COLD_RATIO="$2"
             shift 2
+            ;;
+        --strong-i-1to1)
+            STRONG_I_1TO1=1
+            shift
             ;;
         --output-dir)
             OUTPUT_DIR="$2"
@@ -161,6 +210,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#QUEUE_DEPTHS[@]} -eq 4 ]] \
+    && [[ "${STRONG_I_1TO1}" -eq 0 ]] \
     && [[ "${EXPLICIT_MIXED_INFLIGHT}" -eq 0 ]] \
     && [[ "${EXPLICIT_STRONG_HOT_INFLIGHT}" -eq 0 ]] \
     && [[ "${EXPLICIT_STRONG_COLD_INFLIGHT}" -eq 0 ]] \
@@ -191,6 +241,17 @@ fi
 
 if [[ ${#QUEUE_DEPTHS[@]} -eq 0 ]]; then
     QUEUE_DEPTHS=("${DEFAULT_QUEUE_DEPTHS[@]}")
+fi
+
+if [[ "${STRONG_I_1TO1}" -eq 1 ]]; then
+    if [[ "${EXPLICIT_MIXED_INFLIGHT}" -eq 1 ]] \
+        || [[ "${EXPLICIT_STRONG_HOT_INFLIGHT}" -eq 1 ]] \
+        || [[ "${EXPLICIT_STRONG_COLD_INFLIGHT}" -eq 1 ]] \
+        || [[ -n "${STRONG_HOT_RATIO}" ]] \
+        || [[ -n "${STRONG_COLD_RATIO}" ]]; then
+        echo "--strong-i-1to1 cannot be combined with explicit inflight or ratio options." >&2
+        exit 1
+    fi
 fi
 
 if ! parse_positive_int "${MIXED_INFLIGHT}"; then
@@ -279,20 +340,38 @@ reset_modules() {
     popd >/dev/null
 }
 
+effective_inflight_values() {
+    local queue_depth="$1"
+    local mixed="${MIXED_INFLIGHT}"
+    local strong_hot="${STRONG_HOT_INFLIGHT}"
+    local strong_cold="${STRONG_COLD_INFLIGHT}"
+
+    if [[ "${STRONG_I_1TO1}" -eq 1 ]]; then
+        mixed="${queue_depth}"
+        strong_hot="${queue_depth}"
+        strong_cold="${queue_depth}"
+    fi
+
+    printf '%s\t%s\t%s\n' "${mixed}" "${strong_hot}" "${strong_cold}"
+}
+
 run_case() {
     local mode="$1"
     local queue_depth="$2"
-    local log_file="$3"
+    local mixed_inflight="$3"
+    local strong_hot_inflight="$4"
+    local strong_cold_inflight="$5"
+    local log_file="$6"
     local -a cmd
 
     cmd=(sudo "${BIN_PATH}" "${mode}" --queue-depth "${queue_depth}")
 
     case "${mode}" in
         mixed|hot-only)
-            cmd+=(--mixed-inflight "${MIXED_INFLIGHT}")
+            cmd+=(--mixed-inflight "${mixed_inflight}")
             ;;
         strong-i)
-            cmd+=(--strong-hot-inflight "${STRONG_HOT_INFLIGHT}" --strong-cold-inflight "${STRONG_COLD_INFLIGHT}")
+            cmd+=(--strong-hot-inflight "${strong_hot_inflight}" --strong-cold-inflight "${strong_cold_inflight}")
             ;;
         *)
             echo "Unknown mode: ${mode}" >&2
@@ -320,7 +399,10 @@ run_case() {
 append_summary() {
     local mode="$1"
     local queue_depth="$2"
-    local log_file="$3"
+    local mixed_inflight="$3"
+    local strong_hot_inflight="$4"
+    local strong_cold_inflight="$5"
+    local log_file="$6"
 
     local elapsed
     local total_hot_requests
@@ -345,9 +427,9 @@ append_summary() {
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "${mode}" \
         "${queue_depth}" \
-        "${MIXED_INFLIGHT}" \
-        "${STRONG_HOT_INFLIGHT}" \
-        "${STRONG_COLD_INFLIGHT}" \
+        "${mixed_inflight}" \
+        "${strong_hot_inflight}" \
+        "${strong_cold_inflight}" \
         "${elapsed}" \
         "${total_hot_requests}" \
         "${avg_latency}" \
@@ -373,24 +455,29 @@ require_file "${MODULE_DIR}/snvme-core.ko"
 for queue_depth in "${QUEUE_DEPTHS[@]}"; do
     depth_dir="${OUTPUT_DIR}/qd${queue_depth}"
     mkdir -p "${depth_dir}"
+    IFS=$'\t' read -r effective_mixed_inflight effective_strong_hot_inflight effective_strong_cold_inflight \
+        <<< "$(effective_inflight_values "${queue_depth}")"
 
-    if [[ "${RESET_MODULES}" -eq 1 ]]; then
-        reset_modules "${queue_depth}"
-    fi
-    run_case hot-only "${queue_depth}" "${depth_dir}/hot-only.log"
-    append_summary hot-only "${queue_depth}" "${depth_dir}/hot-only.log"
+    for mode in "${MODES[@]}"; do
+        if [[ "${RESET_MODULES}" -eq 1 ]]; then
+            reset_modules "${queue_depth}"
+        fi
 
-    if [[ "${RESET_MODULES}" -eq 1 ]]; then
-        reset_modules "${queue_depth}"
-    fi
-    run_case mixed "${queue_depth}" "${depth_dir}/mixed.log"
-    append_summary mixed "${queue_depth}" "${depth_dir}/mixed.log"
-
-    if [[ "${RESET_MODULES}" -eq 1 ]]; then
-        reset_modules "${queue_depth}"
-    fi
-    run_case strong-i "${queue_depth}" "${depth_dir}/strong-i.log"
-    append_summary strong-i "${queue_depth}" "${depth_dir}/strong-i.log"
+        run_case \
+            "${mode}" \
+            "${queue_depth}" \
+            "${effective_mixed_inflight}" \
+            "${effective_strong_hot_inflight}" \
+            "${effective_strong_cold_inflight}" \
+            "${depth_dir}/${mode}.log"
+        append_summary \
+            "${mode}" \
+            "${queue_depth}" \
+            "${effective_mixed_inflight}" \
+            "${effective_strong_hot_inflight}" \
+            "${effective_strong_cold_inflight}" \
+            "${depth_dir}/${mode}.log"
+    done
 done
 
 echo

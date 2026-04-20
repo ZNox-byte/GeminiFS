@@ -1,0 +1,21 @@
+mmap is 0x7f30e97ca000
+dstrd  is 0, ctrl->timeout is 30000, max qs is  1024
+request_queues success
+idx start is 129, dbstrd is 0, nr user q is 16
+Strong-isolated mode keeps 4 hot producer threads and 12 cold producer threads, dispatching them through isolated queue pairs with hot depth=32 and cold depth=32 per queue pair.
+Timed run: 5 s
+Queue depth: 32
+Hot threads: 4 | Cold threads: 12 | Active producers: 16
+Mixed inflight: 16 | Strong hot inflight: 32 | Strong cold inflight: 32
+
+--- Hot Data Latency Report ---
+Hot Threads: 4, Cold Threads: 12
+Elapsed Time: 5.064 s
+Total Hot Requests: 150220
+Average Latency: 14211.71 us
+P95 Tail Latency: 27124.00 us
+P99 Tail Latency: 32089.00 us
+Hot Throughput: 115.87 MB/s
+Cold Throughput: 3163.12 MB/s
+Hot Thread Errors: 0
+Cold Thread Errors: 0

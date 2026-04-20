@@ -9,6 +9,8 @@ CHILD_SCRIPT="${SCRIPT_DIR}/run_queue_depth_matrix.sh"
 RUNS=5
 OUTPUT_DIR=""
 FORWARD_ARGS=()
+STRONG_I_1TO1_SWEEP=0
+STRONG_I_1TO1_BUDGET_SWEEP=0
 
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_DIR_DEFAULT="${ROOT_DIR}/results/queue-depth-matrix-repeat5/${TIMESTAMP}"
@@ -22,16 +24,25 @@ Examples:
   scripts/run_queue_depth_matrix_repeat5.sh --hot-budget 10000 --cold-budget 60000 32
   scripts/run_queue_depth_matrix_repeat5.sh --output-dir results/repeat-qd32 32 32 0.5 0.25
   scripts/run_queue_depth_matrix_repeat5.sh --runs 3 --mixed-inflight 32 33
+  scripts/run_queue_depth_matrix_repeat5.sh --strong-i-1to1-sweep
+  scripts/run_queue_depth_matrix_repeat5.sh --strong-i-1to1-budget-sweep
 
 Wrapper options:
   --runs N                 Number of repetitions. Default: 5
   --output-dir DIR         Base directory for repeated runs
+  --strong-i-1to1-sweep    Run qd=16,32,64,128 in strong-i only, with hot/cold inflight = queue_depth
+  --strong-i-1to1-budget-sweep
+                           Same as --strong-i-1to1-sweep, plus --hot-budget 10000 --cold-budget 60000
   -h, --help               Show this help message
 
 Notes:
   1. All non-wrapper options are forwarded to scripts/run_queue_depth_matrix.sh.
   2. Each repetition writes to DIR/run1, DIR/run2, ..., DIR/runN.
   3. The wrapper also creates DIR/summary_all.tsv with the per-run summaries merged.
+  4. --strong-i-1to1-sweep expands to:
+       --modes strong-i --strong-i-1to1 16 32 64 128
+  5. --strong-i-1to1-budget-sweep expands to:
+       --modes strong-i --strong-i-1to1 --hot-budget 10000 --cold-budget 60000 16 32 64 128
 EOF
 }
 
@@ -61,6 +72,14 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --strong-i-1to1-sweep)
+            STRONG_I_1TO1_SWEEP=1
+            shift
+            ;;
+        --strong-i-1to1-budget-sweep)
+            STRONG_I_1TO1_BUDGET_SWEEP=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -84,6 +103,19 @@ fi
 if [[ ! -x "${CHILD_SCRIPT}" ]]; then
     echo "Required script is missing or not executable: ${CHILD_SCRIPT}" >&2
     exit 1
+fi
+
+if [[ "${STRONG_I_1TO1_SWEEP}" -eq 1 ]] && [[ "${STRONG_I_1TO1_BUDGET_SWEEP}" -eq 1 ]]; then
+    echo "Choose either --strong-i-1to1-sweep or --strong-i-1to1-budget-sweep, not both." >&2
+    exit 1
+fi
+
+if [[ "${STRONG_I_1TO1_SWEEP}" -eq 1 ]]; then
+    FORWARD_ARGS=(--modes strong-i --strong-i-1to1 16 32 64 128 "${FORWARD_ARGS[@]}")
+fi
+
+if [[ "${STRONG_I_1TO1_BUDGET_SWEEP}" -eq 1 ]]; then
+    FORWARD_ARGS=(--modes strong-i --strong-i-1to1 --hot-budget 10000 --cold-budget 60000 16 32 64 128 "${FORWARD_ARGS[@]}")
 fi
 
 mkdir -p "${OUTPUT_DIR}"
