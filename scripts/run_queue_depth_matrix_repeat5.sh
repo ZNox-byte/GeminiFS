@@ -122,7 +122,7 @@ mkdir -p "${OUTPUT_DIR}"
 
 AGG_SUMMARY="${OUTPUT_DIR}/summary_all.tsv"
 AGG_SUMMARY_ALIGNED="${OUTPUT_DIR}/summary_all_aligned.txt"
-printf "run\tmode\tqueue_depth\tmixed_inflight\tstrong_hot_inflight\tstrong_cold_inflight\telapsed_time\ttotal_hot_requests\tavg_latency\tp95_latency\tp99_latency\thot_throughput\tcold_throughput\thot_thread_errors\tcold_thread_errors\n" > "${AGG_SUMMARY}"
+printf "run\tmode\tqueue_depth\tmixed_inflight\tstrong_hot_inflight\tstrong_cold_inflight\thot_threads\tcold_threads\thot_queues\tcold_queues\telapsed_time\ttotal_hot_requests\tavg_latency\tp95_latency\tp99_latency\thot_throughput\tcold_throughput\thot_thread_errors\tcold_thread_errors\n" > "${AGG_SUMMARY}"
 
 for ((run = 1; run <= RUNS; ++run)); do
     run_dir="${OUTPUT_DIR}/run${run}"

@@ -1,0 +1,5 @@
+mode	queue_depth	mixed_inflight	strong_hot_inflight	strong_cold_inflight	hot_threads	cold_threads	hot_queues	cold_queues	elapsed_time	total_hot_requests	avg_latency	p95_latency	p99_latency	hot_throughput	cold_throughput	hot_thread_errors	cold_thread_errors
+strong-i	16	16	16	16	4	12	7	9	5.033 s	173654	13620.67 us	31782.00 us	36911.00 us	134.79 MB/s	3257.23 MB/s	0	0
+strong-i	32	32	32	32	4	12	7	9	5.079 s	132245	30832.51 us	49176.00 us	60037.00 us	101.70 MB/s	1577.00 MB/s	0	0
+strong-i	64	64	64	64	4	12	7	9	5.040 s	110946	44899.96 us	66099.00 us	77568.00 us	86.00 MB/s	3053.53 MB/s	0	0
+strong-i	128	128	128	128	4	12	7	9	5.088 s	99239	58404.53 us	94459.00 us	101554.00 us	76.19 MB/s	3121.20 MB/s	0	0

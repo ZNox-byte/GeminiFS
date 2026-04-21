@@ -172,8 +172,12 @@ struct run_config
     unsigned int duration_seconds;
     size_t hot_threads;
     size_t cold_threads;
+    size_t hot_queues;
+    size_t cold_queues;
     bool hot_threads_overridden;
     bool cold_threads_overridden;
+    bool hot_queues_overridden;
+    bool cold_queues_overridden;
 };
 
 static struct run_config g_run_config = {false,
@@ -186,6 +190,10 @@ static struct run_config g_run_config = {false,
                                          DefaultTestDurationSeconds,
                                          DefaultHotThreadCount,
                                          DefaultColdThreadCount,
+                                         DefaultHotThreadCount,
+                                         DefaultColdThreadCount,
+                                         false,
+                                         false,
                                          false,
                                          false};
 static std::atomic<size_t> g_hot_issued(0);
@@ -450,6 +458,10 @@ static int parse_run_config(int argc, char** argv, struct run_config* config_out
                    DefaultTestDurationSeconds,
                    DefaultHotThreadCount,
                    DefaultColdThreadCount,
+                   DefaultHotThreadCount,
+                   DefaultColdThreadCount,
+                   false,
+                   false,
                    false,
                    false};
 
@@ -509,6 +521,26 @@ static int parse_run_config(int argc, char** argv, struct run_config* config_out
             }
             config_out->cold_threads_overridden = true;
         }
+        else if (strcmp(argv[i], "--hot-queues") == 0 || strcmp(argv[i], "--hot_queues") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->hot_queues) != 0
+                || config_out->hot_queues > MaxThreadCount)
+            {
+                fprintf(stderr, "Invalid value for --hot-queues.\n");
+                return EINVAL;
+            }
+            config_out->hot_queues_overridden = true;
+        }
+        else if (strcmp(argv[i], "--cold-queues") == 0 || strcmp(argv[i], "--cold_queues") == 0)
+        {
+            if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->cold_queues) != 0
+                || config_out->cold_queues > MaxThreadCount)
+            {
+                fprintf(stderr, "Invalid value for --cold-queues.\n");
+                return EINVAL;
+            }
+            config_out->cold_queues_overridden = true;
+        }
         else if (strcmp(argv[i], "--mixed-inflight") == 0 || strcmp(argv[i], "--mixed_inflight") == 0)
         {
             if (i + 1 >= argc || parse_size_option(argv[++i], &config_out->mixed_inflight_depth) != 0
@@ -539,7 +571,7 @@ static int parse_run_config(int argc, char** argv, struct run_config* config_out
         else
         {
             fprintf(stderr,
-                    "Unknown option '%s'. Supported options: --hot-budget, --cold-budget, --queue-depth, --duration, --hot-threads, --cold-threads, --mixed-inflight, --strong-hot-inflight, --strong-cold-inflight\n",
+                    "Unknown option '%s'. Supported options: --hot-budget, --cold-budget, --queue-depth, --duration, --hot-threads, --cold-threads, --hot-queues, --cold-queues, --mixed-inflight, --strong-hot-inflight, --strong-cold-inflight\n",
                     argv[i]);
             return EINVAL;
         }
@@ -587,6 +619,56 @@ static int resolve_thread_layout(experiment_mode mode,
     *hot_threads_out = hot_threads;
     *cold_threads_out = mode == MODE_HOT_ONLY ? 0 : cold_threads;
     *active_threads_out = active_threads;
+    return 0;
+}
+
+static int resolve_queue_layout(experiment_mode mode,
+                                const struct run_config* config,
+                                size_t hot_threads,
+                                size_t cold_threads,
+                                size_t* hot_queues_out,
+                                size_t* cold_queues_out,
+                                size_t* active_queues_out)
+{
+    size_t hot_queues = hot_threads;
+    size_t cold_queues = mode == MODE_HOT_ONLY ? 0 : cold_threads;
+
+    if (mode == MODE_STRONG_ISOLATED)
+    {
+        hot_queues = config->hot_queues_overridden ? config->hot_queues : hot_threads;
+        cold_queues = config->cold_queues_overridden ? config->cold_queues : cold_threads;
+
+        if (hot_queues == 0)
+        {
+            fprintf(stderr, "--hot-queues must be at least 1 in strong-i mode.\n");
+            return EINVAL;
+        }
+        if (cold_threads > 0 && cold_queues == 0)
+        {
+            fprintf(stderr, "--cold-queues must be at least 1 when cold producers exist in strong-i mode.\n");
+            return EINVAL;
+        }
+    }
+    else if (config->hot_queues_overridden || config->cold_queues_overridden)
+    {
+        fprintf(stderr, "--hot-queues/--cold-queues are only supported in strong-i mode.\n");
+        return EINVAL;
+    }
+
+    size_t active_queues = mode == MODE_HOT_ONLY ? hot_queues : (hot_queues + cold_queues);
+    if (active_queues == 0 || active_queues > MaxThreadCount)
+    {
+        fprintf(stderr,
+                "Invalid queue layout: hot=%zu cold=%zu exceeds max supported queue pairs=%zu.\n",
+                hot_queues,
+                cold_queues,
+                MaxThreadCount);
+        return EINVAL;
+    }
+
+    *hot_queues_out = hot_queues;
+    *cold_queues_out = mode == MODE_HOT_ONLY ? 0 : cold_queues;
+    *active_queues_out = active_queues;
     return 0;
 }
 
@@ -1229,6 +1311,9 @@ int main(int argc, char** argv)
     size_t hot_thread_count = 0;
     size_t cold_thread_count = 0;
     size_t active_thread_count = 0;
+    size_t hot_queue_count = 0;
+    size_t cold_queue_count = 0;
+    size_t active_queue_count = 0;
     bool use_legacy_isolated_layout = false;
 
     status = parse_run_config(argc, argv, &g_run_config);
@@ -1241,9 +1326,20 @@ int main(int argc, char** argv)
     {
         return 1;
     }
-    use_legacy_isolated_layout = (hot_thread_count == DefaultHotThreadCount
-                               && cold_thread_count == DefaultColdThreadCount
-                               && active_thread_count == MaxThreadCount);
+    status = resolve_queue_layout(mode,
+                                  &g_run_config,
+                                  hot_thread_count,
+                                  cold_thread_count,
+                                  &hot_queue_count,
+                                  &cold_queue_count,
+                                  &active_queue_count);
+    if (status != 0)
+    {
+        return 1;
+    }
+    use_legacy_isolated_layout = (hot_queue_count == DefaultHotThreadCount
+                               && cold_queue_count == DefaultColdThreadCount
+                               && active_queue_count == MaxThreadCount);
     g_hot_issued.store(0, std::memory_order_relaxed);
     g_cold_issued.store(0, std::memory_order_relaxed);
     // 1. 初始化控制节点与分配队列 (沿用你跑通的逻辑)
@@ -1286,8 +1382,8 @@ int main(int argc, char** argv)
     snvme_c_fd = -1;
     snvme_d_fd = -1;
 
-    ctrl->cq_num = active_thread_count;
-    ctrl->sq_num = active_thread_count;
+    ctrl->cq_num = active_queue_count;
+    ctrl->sq_num = active_queue_count;
     ctrl->qs = g_run_config.queue_depth;
 
     unsigned int module_qs = 0;
@@ -1480,38 +1576,34 @@ int main(int argc, char** argv)
     close(snvme_helper_fd);
     snvme_helper_fd = -1;
 
-    for(i = 0; i < active_thread_count; i++)
+    for(i = 0; i < active_queue_count; i++)
     {
         size_t queue_index;
         if(mode == MODE_ISOLATED || mode == MODE_STRONG_ISOLATED)
         {
-            if(mode == MODE_HOT_ONLY || i < hot_thread_count)
+            if(mode == MODE_HOT_ONLY || i < hot_queue_count)
             {
                 queue_index = use_legacy_isolated_layout ? (i * 4) : i;
             }
             else
             {
                 queue_index = use_legacy_isolated_layout
-                    ? (((i - hot_thread_count) % 3) + ((i - hot_thread_count) / 3) * 4 + 1)
+                    ? (((i - hot_queue_count) % 3) + ((i - hot_queue_count) / 3) * 4 + 1)
                     : i;
             }
         }
         else
         {
-            if (mode == MODE_MIXED || mode == MODE_HOT_ONLY)
-            {
-                queue_index = i;
-            }
-            else
-            {
-                queue_index = i;
-            }
+            queue_index = i;
         }
         qps[i].cq = &ctrl->queues[queue_index];
         qps[i].sq = &ctrl->queues[queue_index + ctrl->cq_num];
         qps[i].stop = false;
         qps[i].num_cpls = 0;
+    }
 
+    for(i = 0; i < active_thread_count; i++)
+    {
         infos[i].offset = nvme_ofst[i] >> 9;
         infos[i].namespace_id = disk.ns_id;
         infos[i].queue_size = ctrl->qs;
@@ -1562,7 +1654,7 @@ int main(int argc, char** argv)
         work_threads[i].dispatch_groups = dispatch_groups;
         work_threads[i].dispatch_group_base = 0;
         work_threads[i].dispatch_group_count = 0;
-        work_threads[i].qp = &qps[i];
+        work_threads[i].qp = (i < active_queue_count) ? &qps[i] : NULL;
         work_threads[i].stats = &stats_for_thread[i];
         if(mode == MODE_MIXED)
         {
@@ -1571,7 +1663,7 @@ int main(int argc, char** argv)
             work_threads[i].latencies = (i < hot_thread_count) ? &hot_latencies[i] : NULL;
             work_threads[i].workload = (i < hot_thread_count) ? WORKLOAD_HOT : WORKLOAD_COLD;
             work_threads[i].dispatch_group_base = 0;
-            work_threads[i].dispatch_group_count = active_thread_count;
+            work_threads[i].dispatch_group_count = active_queue_count;
         }
         else if(mode == MODE_HOT_ONLY)
         {
@@ -1580,7 +1672,7 @@ int main(int argc, char** argv)
             work_threads[i].latencies = &hot_latencies[i];
             work_threads[i].workload = WORKLOAD_HOT;
             work_threads[i].dispatch_group_base = 0;
-            work_threads[i].dispatch_group_count = active_thread_count;
+            work_threads[i].dispatch_group_count = active_queue_count;
         }
         else if(mode == MODE_WEAK_MIXED)
         {
@@ -1597,7 +1689,7 @@ int main(int argc, char** argv)
                 work_threads[i].latencies = &hot_latencies[i];
                 work_threads[i].workload = WORKLOAD_HOT;
                 work_threads[i].dispatch_group_base = 0;
-                work_threads[i].dispatch_group_count = hot_thread_count;
+                work_threads[i].dispatch_group_count = hot_queue_count;
             }
             else
             {
@@ -1607,8 +1699,8 @@ int main(int argc, char** argv)
                 work_threads[i].workload = WORKLOAD_COLD;
                 if (mode == MODE_STRONG_ISOLATED)
                 {
-                    work_threads[i].dispatch_group_base = hot_thread_count;
-                    work_threads[i].dispatch_group_count = cold_thread_count;
+                    work_threads[i].dispatch_group_base = hot_queue_count;
+                    work_threads[i].dispatch_group_count = cold_queue_count;
                 }
             }
         }
@@ -1617,7 +1709,7 @@ int main(int argc, char** argv)
 
     if (mode == MODE_MIXED)
     {
-        for (i = 0; i < active_thread_count; ++i)
+        for (i = 0; i < active_queue_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_MIXED_RATIO;
@@ -1627,12 +1719,12 @@ int main(int argc, char** argv)
         printf("Mixed mode runs %zu hot producer threads and %zu cold producer threads over %zu shared queue pairs; each shared queue schedules requests with a 1 hot : 3 cold preference while preserving independent hot/cold arrivals. Mixed inflight=%zu per queue pair.\n",
                hot_thread_count,
                cold_thread_count,
-               active_thread_count,
+               active_queue_count,
                g_run_config.mixed_inflight_depth);
     }
     else if (mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < active_thread_count; ++i)
+        for (i = 0; i < active_queue_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
@@ -1641,7 +1733,7 @@ int main(int argc, char** argv)
         }
         printf("Hot-only mode runs %zu hot producer threads over %zu shared queue pairs with the same dispatcher structure as mixed, but generates only hot requests. Mixed inflight=%zu per queue pair.\n",
                hot_thread_count,
-               active_thread_count,
+               active_queue_count,
                g_run_config.mixed_inflight_depth);
     }
     else if (mode == MODE_WEAK_MIXED)
@@ -1650,23 +1742,25 @@ int main(int argc, char** argv)
     }
     else if (mode == MODE_STRONG_ISOLATED)
     {
-        for (i = 0; i < hot_thread_count; ++i)
+        for (i = 0; i < hot_queue_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
             dispatch_groups[i].inflight_target = g_run_config.strong_hot_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        for (i = hot_thread_count; i < active_thread_count; ++i)
+        for (i = hot_queue_count; i < active_queue_count; ++i)
         {
             dispatch_groups[i].qp = &qps[i];
             dispatch_groups[i].policy = DISPATCH_FIFO;
             dispatch_groups[i].inflight_target = g_run_config.strong_cold_inflight_depth;
             dispatch_groups[i].issue_count = 0;
         }
-        printf("Strong-isolated mode keeps %zu hot producer threads and %zu cold producer threads, dispatching them through isolated queue pairs with hot depth=%zu and cold depth=%zu per queue pair.\n",
+        printf("Strong-isolated mode keeps %zu hot producer threads and %zu cold producer threads, routing them through %zu hot queue pairs and %zu cold queue pairs with hot depth=%zu and cold depth=%zu per queue pair.\n",
                hot_thread_count,
                cold_thread_count,
+               hot_queue_count,
+               cold_queue_count,
                g_run_config.strong_hot_inflight_depth,
                g_run_config.strong_cold_inflight_depth);
     }
@@ -1687,6 +1781,10 @@ int main(int argc, char** argv)
            hot_thread_count,
            cold_thread_count,
            active_thread_count);
+    printf("Hot queues: %zu | Cold queues: %zu | Active queue pairs: %zu\n",
+           hot_queue_count,
+           cold_queue_count,
+           active_queue_count);
     printf("Mixed inflight: %zu | Strong hot inflight: %zu | Strong cold inflight: %zu\n",
            g_run_config.mixed_inflight_depth,
            g_run_config.strong_hot_inflight_depth,
@@ -1697,7 +1795,7 @@ int main(int argc, char** argv)
 
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < active_thread_count; ++i)
+        for (i = 0; i < active_queue_count; ++i)
         {
             try
             {
@@ -1742,7 +1840,7 @@ int main(int argc, char** argv)
 
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < active_thread_count; ++i)
+        for (i = 0; i < active_queue_count; ++i)
         {
             dispatch_groups[i].can_push.notify_all();
             dispatch_groups[i].can_pop.notify_all();
@@ -1756,7 +1854,7 @@ int main(int argc, char** argv)
     }
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < active_thread_count; ++i)
+        for (i = 0; i < active_queue_count; ++i)
         {
             if (dispatchers[i].joinable())
             {
@@ -1765,7 +1863,7 @@ int main(int argc, char** argv)
         }
     }
     run_end_ns = monotonic_time_ns();
-    for(i = 0; i < active_thread_count; i++)
+    for(i = 0; i < active_queue_count; i++)
     {
         qps[i].stop = true;
     }
@@ -1891,13 +1989,13 @@ out:
     keep_running = false;
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < active_thread_count; ++i)
+        for (i = 0; i < active_queue_count; ++i)
         {
             dispatch_groups[i].can_push.notify_all();
             dispatch_groups[i].can_pop.notify_all();
         }
     }
-    for (i = 0; i < active_thread_count; ++i)
+    for (i = 0; i < active_queue_count; ++i)
     {
         qps[i].stop = true;
     }
@@ -1913,7 +2011,7 @@ out:
     }
     if (mode == MODE_MIXED || mode == MODE_STRONG_ISOLATED || mode == MODE_HOT_ONLY)
     {
-        for (i = 0; i < active_thread_count; ++i)
+        for (i = 0; i < active_queue_count; ++i)
         {
             if (dispatchers[i].joinable())
             {

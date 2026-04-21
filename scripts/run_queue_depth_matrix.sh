@@ -11,12 +11,19 @@ DEFAULT_QUEUE_DEPTHS=(64 128)
 QUEUE_DEPTHS=()
 DEFAULT_MODES=(hot-only mixed strong-i)
 MODES=("${DEFAULT_MODES[@]}")
-
+MODES_EXPLICIT=0
+DEFAULT_HOT_THREADS=4
+DEFAULT_COLD_THREADS=12
+DEFAULT_HOT_ONLY_THREADS=16
 MIXED_INFLIGHT="${MIXED_INFLIGHT:-32}"
 STRONG_HOT_INFLIGHT="${STRONG_HOT_INFLIGHT:-16}"
 STRONG_COLD_INFLIGHT="${STRONG_COLD_INFLIGHT:-8}"
 HOT_BUDGET="${HOT_BUDGET:-}"
 COLD_BUDGET="${COLD_BUDGET:-}"
+HOT_THREADS="${HOT_THREADS:-}"
+COLD_THREADS="${COLD_THREADS:-}"
+HOT_QUEUES="${HOT_QUEUES:-}"
+COLD_QUEUES="${COLD_QUEUES:-}"
 STRONG_HOT_RATIO=""
 STRONG_COLD_RATIO=""
 RESET_MODULES=1
@@ -42,12 +49,18 @@ Examples:
   scripts/run_queue_depth_matrix.sh --hot-budget 10000 --cold-budget 60000 32
   scripts/run_queue_depth_matrix.sh 33 32 0.5 0.25
   scripts/run_queue_depth_matrix.sh --modes strong-i --strong-i-1to1 16 32 64 128
+  scripts/run_queue_depth_matrix.sh --modes strong-i --hot-threads 6 --cold-threads 10 16 32 64 128
+  scripts/run_queue_depth_matrix.sh --modes strong-i --hot-queues 2 --cold-queues 14 16 32 64 128
 
 Options:
   --mixed-inflight N         Inflight per queue pair for mixed/hot-only. Default: 32
   --strong-hot-inflight N    Inflight per hot queue pair for strong-i. Default: 16
   --strong-cold-inflight N   Inflight per cold queue pair for strong-i. Default: 8
   --modes LIST               Comma-separated modes to run. Supported: hot-only,mixed,strong-i
+  --hot-threads N            Number of hot producer threads. Default: 4, hot-only default: 16
+  --cold-threads N           Number of cold producer threads. Default: 12
+  --hot-queues N             Number of hot queue pairs in strong-i. Default: same as hot thread count
+  --cold-queues N            Number of cold queue pairs in strong-i. Default: same as cold thread count
   --hot-budget N             Stop after generating N hot requests
   --cold-budget N            Stop after generating N cold requests
   --strong-hot-ratio R       strong-i hot inflight = round(mixed_inflight * R)
@@ -147,6 +160,8 @@ parse_mode_list() {
         fi
         MODES+=("${item}")
     done
+
+    MODES_EXPLICIT=1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -168,6 +183,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --modes)
             parse_mode_list "$2"
+            shift 2
+            ;;
+        --hot-threads)
+            HOT_THREADS="$2"
+            shift 2
+            ;;
+        --cold-threads)
+            COLD_THREADS="$2"
+            shift 2
+            ;;
+        --hot-queues)
+            HOT_QUEUES="$2"
+            shift 2
+            ;;
+        --cold-queues)
+            COLD_QUEUES="$2"
             shift 2
             ;;
         --hot-budget)
@@ -214,6 +245,13 @@ if [[ ${#QUEUE_DEPTHS[@]} -eq 4 ]] \
     && [[ "${EXPLICIT_MIXED_INFLIGHT}" -eq 0 ]] \
     && [[ "${EXPLICIT_STRONG_HOT_INFLIGHT}" -eq 0 ]] \
     && [[ "${EXPLICIT_STRONG_COLD_INFLIGHT}" -eq 0 ]] \
+    && [[ "${MODES_EXPLICIT}" -eq 0 ]] \
+    && [[ -z "${HOT_THREADS}" ]] \
+    && [[ -z "${COLD_THREADS}" ]] \
+    && [[ -z "${HOT_QUEUES}" ]] \
+    && [[ -z "${COLD_QUEUES}" ]] \
+    && [[ -z "${HOT_BUDGET}" ]] \
+    && [[ -z "${COLD_BUDGET}" ]] \
     && [[ -z "${STRONG_HOT_RATIO}" ]] \
     && [[ -z "${STRONG_COLD_RATIO}" ]]; then
     mixed_arg="${QUEUE_DEPTHS[1]}"
@@ -256,6 +294,26 @@ fi
 
 if ! parse_positive_int "${MIXED_INFLIGHT}"; then
     echo "Invalid mixed inflight: ${MIXED_INFLIGHT}" >&2
+    exit 1
+fi
+
+if [[ -n "${HOT_THREADS}" ]] && ! parse_positive_int "${HOT_THREADS}"; then
+    echo "Invalid hot thread count: ${HOT_THREADS}" >&2
+    exit 1
+fi
+
+if [[ -n "${COLD_THREADS}" ]] && ! parse_positive_int "${COLD_THREADS}"; then
+    echo "Invalid cold thread count: ${COLD_THREADS}" >&2
+    exit 1
+fi
+
+if [[ -n "${HOT_QUEUES}" ]] && ! parse_positive_int "${HOT_QUEUES}"; then
+    echo "Invalid hot queue count: ${HOT_QUEUES}" >&2
+    exit 1
+fi
+
+if [[ -n "${COLD_QUEUES}" ]] && ! parse_positive_int "${COLD_QUEUES}"; then
+    echo "Invalid cold queue count: ${COLD_QUEUES}" >&2
     exit 1
 fi
 
@@ -355,13 +413,54 @@ effective_inflight_values() {
     printf '%s\t%s\t%s\n' "${mixed}" "${strong_hot}" "${strong_cold}"
 }
 
+effective_thread_values() {
+    local mode="$1"
+    local hot_threads=""
+    local cold_threads=""
+
+    if [[ "${mode}" == "hot-only" ]]; then
+        hot_threads="${HOT_THREADS:-${DEFAULT_HOT_ONLY_THREADS}}"
+        cold_threads="0"
+    else
+        hot_threads="${HOT_THREADS:-${DEFAULT_HOT_THREADS}}"
+        cold_threads="${COLD_THREADS:-${DEFAULT_COLD_THREADS}}"
+    fi
+
+    printf '%s\t%s\n' "${hot_threads}" "${cold_threads}"
+}
+
+effective_queue_values() {
+    local mode="$1"
+    local hot_threads="$2"
+    local cold_threads="$3"
+    local hot_queues=""
+    local cold_queues=""
+
+    if [[ "${mode}" == "strong-i" ]]; then
+        hot_queues="${HOT_QUEUES:-${hot_threads}}"
+        cold_queues="${COLD_QUEUES:-${cold_threads}}"
+    elif [[ "${mode}" == "hot-only" ]]; then
+        hot_queues="${hot_threads}"
+        cold_queues="0"
+    else
+        hot_queues="${hot_threads}"
+        cold_queues="${cold_threads}"
+    fi
+
+    printf '%s\t%s\n' "${hot_queues}" "${cold_queues}"
+}
+
 run_case() {
     local mode="$1"
     local queue_depth="$2"
     local mixed_inflight="$3"
     local strong_hot_inflight="$4"
     local strong_cold_inflight="$5"
-    local log_file="$6"
+    local hot_threads="$6"
+    local cold_threads="$7"
+    local hot_queues="$8"
+    local cold_queues="$9"
+    local log_file="${10}"
     local -a cmd
 
     cmd=(sudo "${BIN_PATH}" "${mode}" --queue-depth "${queue_depth}")
@@ -372,12 +471,18 @@ run_case() {
             ;;
         strong-i)
             cmd+=(--strong-hot-inflight "${strong_hot_inflight}" --strong-cold-inflight "${strong_cold_inflight}")
+            cmd+=(--hot-queues "${hot_queues}" --cold-queues "${cold_queues}")
             ;;
         *)
             echo "Unknown mode: ${mode}" >&2
             exit 1
             ;;
     esac
+
+    cmd+=(--hot-threads "${hot_threads}")
+    if [[ "${mode}" != "hot-only" ]]; then
+        cmd+=(--cold-threads "${cold_threads}")
+    fi
 
     if [[ -n "${HOT_BUDGET}" ]]; then
         cmd+=(--hot-budget "${HOT_BUDGET}")
@@ -402,7 +507,11 @@ append_summary() {
     local mixed_inflight="$3"
     local strong_hot_inflight="$4"
     local strong_cold_inflight="$5"
-    local log_file="$6"
+    local hot_threads="$6"
+    local cold_threads="$7"
+    local hot_queues="$8"
+    local cold_queues="$9"
+    local log_file="${10}"
 
     local elapsed
     local total_hot_requests
@@ -424,12 +533,16 @@ append_summary() {
     hot_errors="$(extract_metric "${log_file}" "Hot Thread Errors")"
     cold_errors="$(extract_metric "${log_file}" "Cold Thread Errors")"
 
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "${mode}" \
         "${queue_depth}" \
         "${mixed_inflight}" \
         "${strong_hot_inflight}" \
         "${strong_cold_inflight}" \
+        "${hot_threads}" \
+        "${cold_threads}" \
+        "${hot_queues}" \
+        "${cold_queues}" \
         "${elapsed}" \
         "${total_hot_requests}" \
         "${avg_latency}" \
@@ -445,7 +558,7 @@ append_summary() {
 mkdir -p "${OUTPUT_DIR}"
 
 cat > "${SUMMARY_FILE}" <<'EOF'
-mode	queue_depth	mixed_inflight	strong_hot_inflight	strong_cold_inflight	elapsed_time	total_hot_requests	avg_latency	p95_latency	p99_latency	hot_throughput	cold_throughput	hot_thread_errors	cold_thread_errors
+mode	queue_depth	mixed_inflight	strong_hot_inflight	strong_cold_inflight	hot_threads	cold_threads	hot_queues	cold_queues	elapsed_time	total_hot_requests	avg_latency	p95_latency	p99_latency	hot_throughput	cold_throughput	hot_thread_errors	cold_thread_errors
 EOF
 
 require_file "${BIN_PATH}"
@@ -459,6 +572,11 @@ for queue_depth in "${QUEUE_DEPTHS[@]}"; do
         <<< "$(effective_inflight_values "${queue_depth}")"
 
     for mode in "${MODES[@]}"; do
+        IFS=$'\t' read -r effective_hot_threads effective_cold_threads \
+            <<< "$(effective_thread_values "${mode}")"
+        IFS=$'\t' read -r effective_hot_queues effective_cold_queues \
+            <<< "$(effective_queue_values "${mode}" "${effective_hot_threads}" "${effective_cold_threads}")"
+
         if [[ "${RESET_MODULES}" -eq 1 ]]; then
             reset_modules "${queue_depth}"
         fi
@@ -469,6 +587,10 @@ for queue_depth in "${QUEUE_DEPTHS[@]}"; do
             "${effective_mixed_inflight}" \
             "${effective_strong_hot_inflight}" \
             "${effective_strong_cold_inflight}" \
+            "${effective_hot_threads}" \
+            "${effective_cold_threads}" \
+            "${effective_hot_queues}" \
+            "${effective_cold_queues}" \
             "${depth_dir}/${mode}.log"
         append_summary \
             "${mode}" \
@@ -476,6 +598,10 @@ for queue_depth in "${QUEUE_DEPTHS[@]}"; do
             "${effective_mixed_inflight}" \
             "${effective_strong_hot_inflight}" \
             "${effective_strong_cold_inflight}" \
+            "${effective_hot_threads}" \
+            "${effective_cold_threads}" \
+            "${effective_hot_queues}" \
+            "${effective_cold_queues}" \
             "${depth_dir}/${mode}.log"
     done
 done
